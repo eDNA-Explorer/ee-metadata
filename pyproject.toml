@@ -1,0 +1,173 @@
+[tool.poetry]
+name = "ee-metadata"
+version = "0.2.0"
+description = "A high-performance CLI tool from eDNA-Explorer to generate metadata from a directory of fastq files."
+authors = ["Jim Jeffers <jim@ednaexplorer.org>"]
+license = "MIT"
+readme = "README.md"
+homepage = "https://github.com/eDNA-Explorer/ee-metadata"
+repository = "https://github.com/eDNA-Explorer/ee-metadata"
+keywords = ["bioinformatics", "fastq", "metadata", "genomics", "cli", "edna"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Environment :: Console",
+    "Operating System :: OS Independent",
+]
+packages = [{include = "ee_metadata"}]
+include = [
+    "ee_metadata/primers.csv",
+]
+
+[tool.poetry.dependencies]
+python = "^3.8"
+polars = "^1.3.0"
+typer = {extras = ["all"], version = "^0.12.3"}
+# 'rich' for beautiful terminal output is included with typer[all]
+python-dateutil = "^2.8.2"
+rapidfuzz = "^3.6.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.0.0"
+ruff = "^0.2.0"
+pre-commit = "^3.5.0"
+
+[tool.poetry.scripts]
+ee-metadata = "ee_metadata.main:app"
+
+# =============================================================================
+# Ruff Configuration
+# =============================================================================
+
+[tool.ruff]
+# Set the maximum line length to 88 (Black's default)
+line-length = 88
+indent-width = 4
+
+# Assume Python 3.8+
+target-version = "py38"
+
+# Include common Python files
+include = ["*.py", "*.pyi", "**/pyproject.toml"]
+
+# Exclude common directories
+exclude = [
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".git-rewrite",
+    ".hg",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".pytype",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "node_modules",
+    "venv",
+]
+
+[tool.ruff.lint]
+# Enable selected rule sets
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "N",      # pep8-naming
+    "UP",     # pyupgrade
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "SIM",    # flake8-simplify
+    "TCH",    # flake8-type-checking
+    "Q",      # flake8-quotes
+    "RET",    # flake8-return
+    "PTH",    # flake8-use-pathlib
+    "T20",    # flake8-print
+    "PIE",    # flake8-pie
+    "PL",     # pylint
+    "TRY",    # tryceratops
+    "FLY",    # flynt
+    "PERF",   # perflint
+    "FURB",   # refurb
+    "RUF",    # ruff-specific rules
+]
+
+# Disable specific rules that might be too strict for this project
+ignore = [
+    "E501",   # Line too long (handled by formatter)
+    "PLR0913", # Too many arguments
+    "PLR0912", # Too many branches
+    "PLR0915", # Too many statements
+    "PLR2004", # Magic value used in comparison
+    "TRY003",  # Avoid specifying long messages outside exception class
+    "T201",    # print found (we use console.print but might have debug prints)
+    "B008",    # Do not perform function calls in argument defaults (common in Typer)
+]
+
+# Allow fix for all enabled rules (when using --fix)
+fixable = ["ALL"]
+unfixable = []
+
+# Allow unused variables when underscore-prefixed
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.lint.per-file-ignores]
+# Ignore specific rules for specific files
+"tests/**/*.py" = [
+    "PLR2004",  # Magic value used in comparison
+    "S101",     # Use of assert
+    "T201",     # print statements in tests
+]
+
+[tool.ruff.format]
+# Use double quotes for strings
+quote-style = "double"
+
+# Use tabs or spaces for indentation
+indent-style = "space"
+
+# Respect magic trailing commas
+skip-magic-trailing-comma = false
+
+# Automatically detect the appropriate line ending
+line-ending = "auto"
+
+# Enable auto-formatting of code examples in docstrings
+docstring-code-format = true
+
+[tool.ruff.lint.isort]
+# Use Black-compatible import sorting
+known-first-party = ["ee_metadata"]
+force-single-line = false
+combine-as-imports = true
+
+[tool.ruff.lint.mccabe]
+# Set maximum complexity for functions
+max-complexity = 12
+
+[tool.ruff.lint.pylint]
+# Maximum number of arguments for function
+max-args = 8
+# Maximum number of local variables for function  
+max-locals = 20
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
