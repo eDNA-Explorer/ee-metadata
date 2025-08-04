@@ -1,0 +1,55 @@
+# Pre-commit configuration for ee-metadata
+# See https://pre-commit.com for more information
+
+repos:
+  # Ruff linter and formatter
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.2.0
+    hooks:
+      # Run the linter
+      - id: ruff
+        args: [--fix]
+        types_or: [python, pyi, jupyter]
+      # Run the formatter
+      - id: ruff-format
+        types_or: [python, pyi, jupyter]
+
+  # Additional hooks for code quality
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      # Check for files that would conflict in case-insensitive filesystems
+      - id: check-case-conflict
+      # Check for files that contain merge conflict strings
+      - id: check-merge-conflict
+      # Check yaml files for parseable syntax
+      - id: check-yaml
+      # Check toml files for parseable syntax
+      - id: check-toml
+      # Check json files for parseable syntax
+      - id: check-json
+      # Ensure files end with a newline
+      - id: end-of-file-fixer
+      # Remove trailing whitespace
+      - id: trailing-whitespace
+      # Check for large files (> 500KB)
+      - id: check-added-large-files
+        args: ['--maxkb=500']
+      # Prevent committing directly to main/master
+      - id: no-commit-to-branch
+        args: ['--branch', 'main', '--branch', 'master']
+
+  # Security checks
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.4.0
+    hooks:
+      - id: detect-secrets
+        args: ['--baseline', '.secrets.baseline']
+        exclude: package.lock.json
+
+# Configuration for pre-commit
+default_stages: [commit]
+fail_fast: false
+
+# Skip pre-commit for specific commits (use with caution)
+# To skip: git commit -m "message" --no-verify
