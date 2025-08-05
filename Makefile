@@ -29,6 +29,12 @@ help:
 	@echo "Pre-commit:"
 	@echo "  pre-commit-install   Install pre-commit hooks"
 	@echo "  pre-commit-run       Run pre-commit on all files"
+	@echo ""
+	@echo "Release:"
+	@echo "  release              Create patch release (default)"
+	@echo "  release-patch        Create patch release (0.0.X)"
+	@echo "  release-minor        Create minor release (0.X.0)"
+	@echo "  release-major        Create major release (X.0.0)"
 
 # Installation and setup
 install:
@@ -84,3 +90,18 @@ ci: check test
 # Quick development cycle
 dev: fix test
 	@echo "✅ Development cycle complete!"
+
+# Release management
+release-patch:
+	@echo "Creating patch release..."
+	@./scripts/release.sh patch
+
+release-minor:
+	@echo "Creating minor release..."
+	@./scripts/release.sh minor
+
+release-major:
+	@echo "Creating major release..."
+	@./scripts/release.sh major
+
+release: release-patch
