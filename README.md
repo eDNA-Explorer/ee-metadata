@@ -2,6 +2,8 @@
 
 A high-performance, command-line tool from eDNA-Explorer to scan a directory of .fastq.gz files, identify primer sequences, pair forward and reverse reads, and generate a metadata CSV file. Built with Polars for maximum speed and efficiency.
 
+![cleanshot_2025-08-04_at_14 58 10](https://github.com/user-attachments/assets/27709a1b-3873-4e08-bc84-23d667295220)
+
 ## Features
 
 - **Fast Analysis**: Leverages the Polars DataFrame library for rapid processing of primer and metadata files.
