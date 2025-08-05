@@ -14,7 +14,7 @@ on:
         - testpypi
         - pypi
 
-# Minimal permissions for security
+# Minimal permissions for security + OIDC
 permissions:
   contents: read
   id-token: write # Required for trusted publishing to PyPI
@@ -45,13 +45,13 @@ jobs:
     
     - name: Publish to TestPyPI
       if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'testpypi'
-      env:
-        POETRY_REPOSITORIES_TESTPYPI_URL: https://test.pypi.org/legacy/
-        POETRY_PYPI_TOKEN_TESTPYPI: ${{ secrets.TEST_PYPI_API_TOKEN }}
-      run: poetry publish --repository testpypi
+      uses: pypa/gh-action-pypi-publish@8a08d616893759ef8e1aa1f2785787c0b97e20d6 # v1.10.0
+      with:
+        repository-url: https://test.pypi.org/legacy/
+        packages-dir: dist/
     
     - name: Publish to PyPI
       if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'pypi')
-      env:
-        POETRY_PYPI_TOKEN_PYPI: ${{ secrets.PYPI_API_TOKEN }}
-      run: poetry publish
+      uses: pypa/gh-action-pypi-publish@8a08d616893759ef8e1aa1f2785787c0b97e20d6 # v1.10.0
+      with:
+        packages-dir: dist/
