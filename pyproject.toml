@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "ee-metadata"
-version = "0.2.1"
+version = "0.2.2"
 description = "A high-performance CLI tool from eDNA-Explorer to generate metadata from a directory of fastq files."
 authors = ["Jim Jeffers <jim@ednaexplorer.org>"]
 license = "MIT"
