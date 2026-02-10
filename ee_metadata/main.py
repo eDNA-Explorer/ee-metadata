@@ -11,6 +11,18 @@ from rapidfuzz import fuzz
 from rich.console import Console
 from rich.table import Table
 
+from ee_metadata.auth import (
+    AuthError,
+    TokenExpiredError,
+    TokenNotFoundError,
+    clear_token,
+    decode_token_claims,
+    generate_state,
+    load_token,
+    save_token,
+    validate_token,
+)
+
 # Initialize Typer app and Rich console for nice terminal output
 app = typer.Typer()
 console = Console()
@@ -1086,10 +1098,9 @@ def classify_sample_type_with_rule(type_str: str, rule: Optional[str] = None) ->
         # Negative rule - if type_str does NOT contain the pattern, it's a sample
         pattern = rule[1:].lower()
         return pattern not in type_lower
-    else:
-        # Positive rule - if type_str contains the pattern, it's a sample
-        pattern = rule.lower()
-        return pattern in type_lower
+    # Positive rule - if type_str contains the pattern, it's a sample
+    pattern = rule.lower()
+    return pattern in type_lower
 
 
 def classify_sample_type_default(type_str: str) -> bool:
@@ -1132,6 +1143,178 @@ def classify_sample_type_default(type_str: str) -> bool:
 def classify_sample_type(type_str: str) -> bool:
     """Classify sample type as Sample (True) or Control (False)."""
     return classify_sample_type_default(type_str)
+
+
+# =============================================================================
+# Authentication Commands
+# =============================================================================
+
+
+@app.command()
+def login(
+    api_url: str = typer.Option(
+        "https://www.ednaexplorer.org",
+        "--api-url",
+        "-u",
+        help="API URL (default: https://www.ednaexplorer.org)",
+        envvar="EDNA_API_URL",
+    ),
+):
+    """Log in to eDNA Explorer.
+
+    Opens the eDNA Explorer web app to generate an API token,
+    then validates and saves the token locally.
+    """
+    # Generate state for CSRF protection
+    state = generate_state()
+
+    console.print("\n[bold cyan]eDNA Explorer Login[/bold cyan]\n")
+    console.print("Open this URL to authenticate:\n")
+    console.print(f"  [link]{api_url}/cli/authorize?state={state}[/link]\n")
+
+    token = typer.prompt("Paste your auth token here")
+    if not token.strip():
+        console.print("[bold red]Error:[/bold red] Token cannot be empty.")
+        raise typer.Exit(code=1)
+
+    token = token.strip()
+
+    # Verify state before server validation
+    try:
+        claims = decode_token_claims(token)
+        if claims.get("state") != state:
+            console.print(
+                "[bold red]Error:[/bold red] Token was not generated for this session. "
+                "Please try again."
+            )
+            raise typer.Exit(code=1)
+    except AuthError as e:
+        console.print(f"[bold red]Error:[/bold red] {e}")
+        raise typer.Exit(code=1) from None
+
+    console.print("\n[dim]Validating token...[/dim]")
+
+    try:
+        user = validate_token(token, api_url)
+        save_token(token, api_url)
+        display_name = user.name or user.email
+        console.print(f"\n[bold green]✓ Logged in as {display_name}[/bold green]")
+        console.print(f"[dim]Email: {user.email}[/dim]")
+        console.print("[dim]Token expires in 8 hours[/dim]")
+    except (AuthError, TokenExpiredError) as e:
+        console.print(f"[bold red]Error:[/bold red] {e}")
+        raise typer.Exit(code=1) from None
+
+
+@app.command()
+def logout():
+    """Log out of eDNA Explorer.
+
+    Removes the locally stored authentication token.
+    """
+    if clear_token():
+        console.print("[bold green]✓ Logged out[/bold green]")
+    else:
+        console.print("[yellow]Already logged out (no token found)[/yellow]")
+
+
+@app.command()
+def upload(
+    directory: Path = typer.Argument(
+        ...,
+        help="Directory containing FASTQ files to upload.",
+        autocompletion=complete_path,
+    ),
+    project: str = typer.Option(
+        ...,
+        "--project",
+        "-p",
+        help="Project ID to upload files to.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Show what would be uploaded without actually uploading.",
+    ),
+):
+    """Upload FASTQ files to eDNA Explorer.
+
+    Requires authentication. Run 'ee-metadata login' first.
+
+    Note: Full upload functionality is coming soon.
+    """
+    # Validate directory exists
+    if not directory.exists():
+        console.print(f"[bold red]Error:[/bold red] Directory not found: {directory}")
+        raise typer.Exit(code=1)
+
+    if not directory.is_dir():
+        console.print(f"[bold red]Error:[/bold red] Not a directory: {directory}")
+        raise typer.Exit(code=1)
+
+    # Load and validate token
+    try:
+        token_data = load_token()
+    except TokenNotFoundError as e:
+        console.print(f"[bold red]Error:[/bold red] {e}")
+        raise typer.Exit(code=1) from None
+    except AuthError as e:
+        console.print(f"[bold red]Error:[/bold red] {e}")
+        raise typer.Exit(code=1) from None
+
+    # Validate token is still valid
+    console.print("[dim]Checking authentication...[/dim]")
+
+    try:
+        user = validate_token(token_data.token, token_data.api_url)
+    except TokenExpiredError:
+        console.print(
+            "[bold red]Error:[/bold red] Your session has expired. "
+            "Run 'ee-metadata login' again."
+        )
+        raise typer.Exit(code=1) from None
+    except AuthError as e:
+        console.print(f"[bold red]Error:[/bold red] {e}")
+        raise typer.Exit(code=1) from None
+
+    # Show auth status
+    display_name = user.name or user.email
+    console.print(f"[bold green]✓ Authenticated as {display_name}[/bold green]\n")
+
+    # Scan for FASTQ files
+    files = list(directory.glob("*.fastq.gz"))
+    if not files:
+        console.print(
+            f"[bold yellow]Warning:[/bold yellow] No .fastq.gz files found in "
+            f"{directory}"
+        )
+        raise typer.Exit(code=0)
+
+    # Show file info
+    total_size = sum(f.stat().st_size for f in files)
+    size_str = (
+        f"{total_size / (1024 * 1024):.1f} MB"
+        if total_size >= 1024 * 1024
+        else f"{total_size / 1024:.1f} KB"
+    )
+
+    console.print(f"[bold cyan]Directory:[/bold cyan] {directory}")
+    console.print(f"[bold cyan]Project:[/bold cyan] {project}")
+    console.print(
+        f"[bold cyan]Files:[/bold cyan] {len(files)} FASTQ files ({size_str})"
+    )
+
+    if dry_run:
+        console.print("\n[dim]Files that would be uploaded:[/dim]")
+        for f in sorted(files):
+            console.print(f"  {f.name}")
+
+    console.print("\n[bold yellow]Upload functionality coming soon![/bold yellow]")
+
+
+# =============================================================================
+# Metadata Generation Command
+# =============================================================================
 
 
 @app.command()
@@ -1517,7 +1700,7 @@ def generate(
             sample_col = column_mapping["sample_name"]
             for i in range(metadata_df.height):
                 row_data = metadata_df.row(i, named=True)
-                sample_name = row_data.get(sample_col, f"Sample_{i+1}")
+                sample_name = row_data.get(sample_col, f"Sample_{i + 1}")
                 paired_samples.append(
                     {
                         "Sample ID": str(sample_name),
@@ -1699,25 +1882,23 @@ def generate(
 
                             if choice == "skip":
                                 break
-                            elif choice == "both":
+                            if choice == "both":
                                 disambiguated_high_priority.extend(markers)
                                 break
-                            else:
-                                try:
-                                    choice_num = int(choice)
-                                    if 1 <= choice_num <= len(markers):
-                                        disambiguated_high_priority.append(
-                                            markers[choice_num - 1]
-                                        )
-                                        break
-                                    else:
-                                        console.print(
-                                            f"[bold red]Error:[/bold red] Please enter a number between 1 and {len(markers)}"
-                                        )
-                                except ValueError:
-                                    console.print(
-                                        "[bold red]Error:[/bold red] Please enter a number, 'both', or 'skip'"
+                            try:
+                                choice_num = int(choice)
+                                if 1 <= choice_num <= len(markers):
+                                    disambiguated_high_priority.append(
+                                        markers[choice_num - 1]
                                     )
+                                    break
+                                console.print(
+                                    f"[bold red]Error:[/bold red] Please enter a number between 1 and {len(markers)}"
+                                )
+                            except ValueError:
+                                console.print(
+                                    "[bold red]Error:[/bold red] Please enter a number, 'both', or 'skip'"
+                                )
 
                 # Add non-conflicting markers directly
                 for marker_value, markers in marker_groups.items():
@@ -1783,7 +1964,7 @@ def generate(
                             marker_id for marker_id, _ in sorted_markers
                         ]
                         break
-                    elif selection == "high":
+                    if selection == "high":
                         confirmed_markers = [
                             marker_id for marker_id, _ in high_priority_markers
                         ]
@@ -1795,10 +1976,9 @@ def generate(
                         if all(1 <= i <= total_markers for i in indices):
                             confirmed_markers = [all_indices[i] for i in indices]
                             break
-                        else:
-                            console.print(
-                                f"[bold red]Error:[/bold red] Please enter numbers between 1 and {total_markers}"
-                            )
+                        console.print(
+                            f"[bold red]Error:[/bold red] Please enter numbers between 1 and {total_markers}"
+                        )
                     except ValueError:
                         console.print(
                             "[bold red]Error:[/bold red] Please enter numbers separated by commas, 'high', or 'all'"
@@ -1850,10 +2030,9 @@ def generate(
                 if all(1 <= i <= len(all_primers) for i in indices):
                     confirmed_markers = [all_primers[i - 1][0] for i in indices]
                     break
-                else:
-                    console.print(
-                        f"[bold red]Error:[/bold red] Please enter numbers between 1 and {len(all_primers)}"
-                    )
+                console.print(
+                    f"[bold red]Error:[/bold red] Please enter numbers between 1 and {len(all_primers)}"
+                )
             except ValueError:
                 console.print(
                     "[bold red]Error:[/bold red] Please enter numbers separated by commas or 'all'"
@@ -2002,7 +2181,7 @@ def generate(
 
     # Process FASTQ samples (matched and unmatched)
     for sample in paired_samples:
-        row = {col: "" for col in metadata_cols}
+        row = dict.fromkeys(metadata_cols, "")
 
         # Start with FASTQ-derived data
         row.update(
@@ -2071,7 +2250,7 @@ def generate(
         )
 
         for metadata_index in unmatched_metadata_indices:
-            row = {col: "" for col in metadata_cols}
+            row = dict.fromkeys(metadata_cols, "")
             metadata_row = metadata_df.row(metadata_index, named=True)
 
             # Fill in metadata fields
