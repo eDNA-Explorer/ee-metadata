@@ -1,12 +1,18 @@
 """Authentication module for eDNA Explorer CLI."""
 
+from __future__ import annotations
+
 import base64
 import contextlib
 import json
 import secrets
 import stat
+import threading
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import NamedTuple
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
@@ -189,3 +195,115 @@ def clear_token() -> bool:
         TOKEN_FILE.unlink()
         return True
     return False
+
+
+# =============================================================================
+# Browser-based login (local callback server)
+# =============================================================================
+
+CALLBACK_TIMEOUT = 300.0  # 5 minutes
+
+
+class CallbackResult(NamedTuple):
+    """Result from the local callback server."""
+
+    token: str
+    state: str
+
+
+class _CallbackHandler(BaseHTTPRequestHandler):
+    """HTTP handler for the OAuth callback from the browser."""
+
+    server: _CallbackServer
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        if parsed.path != "/callback":
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        params = parse_qs(parsed.query)
+        self.server.callback_token = params.get("token", [None])[0]
+        self.server.callback_state = params.get("state", [None])[0]
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        html = (
+            "<html><body style='font-family:system-ui;display:flex;"
+            "justify-content:center;align-items:center;height:100vh;margin:0'>"
+            "<div style='text-align:center'>"
+            "<h1 style='color:#16a34a'>&#10003; Authentication successful</h1>"
+            "<p style='color:#6b7280'>You can close this tab and return to the terminal.</p>"
+            "</div></body></html>"
+        )
+        self.wfile.write(html.encode())
+        self.server.callback_received.set()
+
+    def log_message(self, format: str, *args: object) -> None:
+        """Suppress default HTTP server logging."""
+
+
+class _CallbackServer(HTTPServer):
+    """HTTP server that waits for a single OAuth callback."""
+
+    def __init__(self, port: int = 0) -> None:
+        super().__init__(("127.0.0.1", port), _CallbackHandler)
+        self.callback_token: str | None = None
+        self.callback_state: str | None = None
+        self.callback_received = threading.Event()
+
+
+def start_callback_server() -> tuple[_CallbackServer, int]:
+    """Create and bind the local callback server.
+
+    Returns:
+        Tuple of (server instance, port number)
+
+    Raises:
+        OSError: If unable to bind to any port on localhost
+    """
+    server = _CallbackServer(port=0)
+    port = server.server_address[1]
+    return server, port
+
+
+def wait_for_callback(
+    server: _CallbackServer,
+    timeout: float = CALLBACK_TIMEOUT,
+) -> CallbackResult | None:
+    """Run the callback server and wait for the browser redirect.
+
+    Args:
+        server: The callback server from start_callback_server()
+        timeout: Maximum seconds to wait (default: 5 minutes)
+
+    Returns:
+        CallbackResult if callback received, None if timed out
+    """
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    try:
+        got_callback = server.callback_received.wait(timeout=timeout)
+        if not got_callback or not server.callback_token:
+            return None
+        return CallbackResult(
+            token=server.callback_token,
+            state=server.callback_state or "",
+        )
+    finally:
+        server.shutdown()
+
+
+def open_browser(url: str) -> bool:
+    """Open URL in the default browser.
+
+    Returns:
+        True if the browser was opened, False otherwise.
+    """
+    try:
+        return webbrowser.open(url)
+    except Exception:
+        return False
