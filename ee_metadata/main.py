@@ -19,8 +19,11 @@ from ee_metadata.auth import (
     decode_token_claims,
     generate_state,
     load_token,
+    open_browser,
     save_token,
+    start_callback_server,
     validate_token,
+    wait_for_callback,
 )
 
 # Initialize Typer app and Rich console for nice terminal output
@@ -1159,27 +1162,66 @@ def login(
         help="API URL (default: https://www.ednaexplorer.org)",
         envvar="EDNA_API_URL",
     ),
+    no_browser: bool = typer.Option(
+        False,
+        "--no-browser",
+        help="Skip automatic browser login; use manual token paste.",
+    ),
 ):
     """Log in to eDNA Explorer.
 
-    Opens the eDNA Explorer web app to generate an API token,
-    then validates and saves the token locally.
+    Opens a browser to authenticate, then automatically receives
+    the token. Falls back to manual token paste if needed.
     """
-    # Generate state for CSRF protection
     state = generate_state()
-
     console.print("\n[bold cyan]eDNA Explorer Login[/bold cyan]\n")
-    console.print("Open this URL to authenticate:\n")
-    console.print(f"  [link]{api_url}/cli/authorize?state={state}[/link]\n")
 
-    token = typer.prompt("Paste your auth token here")
-    if not token.strip():
-        console.print("[bold red]Error:[/bold red] Token cannot be empty.")
-        raise typer.Exit(code=1)
+    token = None
 
-    token = token.strip()
+    # --- Attempt 1: Automatic browser flow ---
+    if not no_browser:
+        try:
+            server, port = start_callback_server()
+        except OSError:
+            server = None
 
-    # Verify state before server validation
+        if server is not None:
+            auth_url = f"{api_url}/cli/authorize?state={state}&port={port}"
+            console.print("Opening browser for authentication...\n")
+            console.print(f"  [link]{auth_url}[/link]\n")
+
+            browser_opened = open_browser(auth_url)
+            if not browser_opened:
+                console.print(
+                    "[yellow]Could not open browser automatically.[/yellow]"
+                )
+                console.print("Please open the URL above manually.\n")
+
+            console.print("[dim]Waiting for authorization...[/dim]\n")
+
+            result = wait_for_callback(server)
+            if result is not None:
+                token = result.token
+
+    # --- Attempt 2: Manual paste fallback ---
+    if token is None:
+        if not no_browser:
+            console.print(
+                "[yellow]Browser login did not complete. "
+                "Falling back to manual token paste.[/yellow]\n"
+            )
+
+        auth_url = f"{api_url}/cli/authorize?state={state}"
+        console.print("Open this URL to authenticate:\n")
+        console.print(f"  [link]{auth_url}[/link]\n")
+
+        token = typer.prompt("Paste your auth token here")
+        if not token.strip():
+            console.print("[bold red]Error:[/bold red] Token cannot be empty.")
+            raise typer.Exit(code=1)
+        token = token.strip()
+
+    # --- Validate state embedded in JWT ---
     try:
         claims = decode_token_claims(token)
         if claims.get("state") != state:
@@ -1192,7 +1234,8 @@ def login(
         console.print(f"[bold red]Error:[/bold red] {e}")
         raise typer.Exit(code=1) from None
 
-    console.print("\n[dim]Validating token...[/dim]")
+    # --- Validate token server-side and save ---
+    console.print("[dim]Validating token...[/dim]")
 
     try:
         user = validate_token(token, api_url)
