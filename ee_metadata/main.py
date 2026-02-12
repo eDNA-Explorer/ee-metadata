@@ -1200,7 +1200,7 @@ def login(
         display_name = user.name or user.email
         console.print(f"\n[bold green]✓ Logged in as {display_name}[/bold green]")
         console.print(f"[dim]Email: {user.email}[/dim]")
-        console.print("[dim]Token expires in 8 hours[/dim]")
+        console.print("[dim]Token expires in 2 hours[/dim]")
     except (AuthError, TokenExpiredError) as e:
         console.print(f"[bold red]Error:[/bold red] {e}")
         raise typer.Exit(code=1) from None
