@@ -207,7 +207,7 @@ CALLBACK_TIMEOUT = 300.0  # 5 minutes
 class CallbackResult(NamedTuple):
     """Result from the local callback server."""
 
-    token: str
+    code: str
     state: str
 
 
@@ -216,7 +216,7 @@ class _CallbackHandler(BaseHTTPRequestHandler):
 
     server: _CallbackServer
 
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path != "/callback":
             self.send_response(404)
@@ -224,7 +224,7 @@ class _CallbackHandler(BaseHTTPRequestHandler):
             return
 
         params = parse_qs(parsed.query)
-        self.server.callback_token = params.get("token", [None])[0]
+        self.server.callback_code = params.get("code", [None])[0]
         self.server.callback_state = params.get("state", [None])[0]
 
         self.send_response(200)
@@ -250,7 +250,7 @@ class _CallbackServer(HTTPServer):
 
     def __init__(self, port: int = 0) -> None:
         super().__init__(("127.0.0.1", port), _CallbackHandler)
-        self.callback_token: str | None = None
+        self.callback_code: str | None = None
         self.callback_state: str | None = None
         self.callback_received = threading.Event()
 
@@ -287,14 +287,51 @@ def wait_for_callback(
 
     try:
         got_callback = server.callback_received.wait(timeout=timeout)
-        if not got_callback or not server.callback_token:
+        if not got_callback or not server.callback_code:
             return None
         return CallbackResult(
-            token=server.callback_token,
+            code=server.callback_code,
             state=server.callback_state or "",
         )
     finally:
         server.shutdown()
+
+
+def exchange_code(code: str, api_url: str) -> str:
+    """Exchange a short-lived authorization code for a CLI token.
+
+    Args:
+        code: The authorization code from the browser callback
+        api_url: Base URL of the API
+
+    Returns:
+        The CLI JWT token
+
+    Raises:
+        AuthError: If the exchange fails
+    """
+    url = f"{api_url.rstrip('/')}/api/cli/exchange"
+
+    try:
+        with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
+            response = client.post(url, json={"code": code})
+
+        if response.status_code != 200:
+            raise AuthError(
+                f"Code exchange failed ({response.status_code}): {response.text}"
+            )
+
+        data = response.json()
+        token = data.get("token")
+        if not token:
+            raise AuthError("Code exchange returned empty token.")
+
+    except httpx.TimeoutException as e:
+        raise AuthError(f"Request timed out connecting to {api_url}") from e
+    except httpx.RequestError as e:
+        raise AuthError(f"Failed to connect to {api_url}: {e}") from e
+
+    return token
 
 
 def open_browser(url: str) -> bool:
