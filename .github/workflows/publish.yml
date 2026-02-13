@@ -23,33 +23,27 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     environment: ${{ github.event.inputs.environment || 'pypi' }}
-    
+
     steps:
     # Pin to specific commit SHA for security
     - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
-    
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@6b9c6063abd6010835644d4c2e1bef4cf5cd0fca # v6.0.1
+
     - name: Set up Python
-      uses: actions/setup-python@f677139bbe7f9c59b41e40162b753c062f5d49a3 # v5.2.0
-      with:
-        python-version: '3.11'
-    
-    - name: Install Poetry
-      uses: snok/install-poetry@76e04a911780d5b312d89783f7b1cd627778900a # v1.4.1
-      with:
-        version: latest
-        virtualenvs-create: true
-        virtualenvs-in-project: true
-    
+      run: uv python install 3.11
+
     - name: Build package
-      run: poetry build
-    
+      run: uv build
+
     - name: Publish to TestPyPI
       if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'testpypi'
       uses: pypa/gh-action-pypi-publish@8a08d616893759ef8e1aa1f2785787c0b97e20d6 # v1.10.0
       with:
         repository-url: https://test.pypi.org/legacy/
         packages-dir: dist/
-    
+
     - name: Publish to PyPI
       if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'pypi')
       uses: pypa/gh-action-pypi-publish@8a08d616893759ef8e1aa1f2785787c0b97e20d6 # v1.10.0

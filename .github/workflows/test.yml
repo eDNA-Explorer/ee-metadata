@@ -17,36 +17,32 @@ jobs:
       matrix:
         os: [ubuntu-latest, macOS-latest]
         python-version: ['3.10', '3.11', '3.12', '3.13']
-    
+
     steps:
     # Pin to specific commit SHA for security
     - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
-    
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@6b9c6063abd6010835644d4c2e1bef4cf5cd0fca # v6.0.1
+      with:
+        enable-cache: true
+
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@f677139bbe7f9c59b41e40162b753c062f5d49a3 # v5.2.0
-      with:
-        python-version: ${{ matrix.python-version }}
-    
-    - name: Install Poetry
-      uses: snok/install-poetry@76e04a911780d5b312d89783f7b1cd627778900a # v1.4.1
-      with:
-        version: latest
-        virtualenvs-create: true
-        virtualenvs-in-project: true
-    
+      run: uv python install ${{ matrix.python-version }}
+
     - name: Install dependencies
-      run: poetry install
-    
+      run: uv sync --python ${{ matrix.python-version }}
+
     - name: Test CLI import
-      run: poetry run python -c "from ee_metadata.main import app; print('✅ Import successful')"
-    
+      run: uv run python -c "from ee_metadata.main import app; print('✅ Import successful')"
+
     - name: Test CLI help
-      run: poetry run ee-metadata --help
-    
+      run: uv run ee-metadata --help
+
     - name: Build package
-      run: poetry build
-    
+      run: uv build
+
     - name: Test wheel installation
       run: |
-        pip install dist/*.whl
+        uv pip install dist/*.whl --system
         ee-metadata --help
