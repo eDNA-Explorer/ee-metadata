@@ -67,7 +67,7 @@ def save_token(token: str, api_url: str) -> None:
     Raises:
         OSError: If unable to create directory or write file
     """
-    TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+    TOKEN_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     TOKEN_FILE.write_text(json.dumps({"token": token, "api_url": api_url}, indent=2))
 
     # Set secure permissions (owner read/write only)
