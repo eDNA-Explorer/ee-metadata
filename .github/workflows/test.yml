@@ -43,6 +43,4 @@ jobs:
       run: uv build
 
     - name: Test wheel installation
-      run: |
-        uv pip install dist/*.whl --system
-        ee-metadata --help
+      run: uv run --no-project --with dist/*.whl ee-metadata --help
