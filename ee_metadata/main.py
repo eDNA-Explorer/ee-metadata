@@ -17,6 +17,7 @@ from ee_metadata.auth import (
     TokenNotFoundError,
     clear_token,
     decode_token_claims,
+    exchange_code,
     generate_state,
     load_token,
     open_browser,
@@ -1201,7 +1202,12 @@ def login(
 
             result = wait_for_callback(server)
             if result is not None:
-                token = result.token
+                # Exchange the short-lived code for a full token
+                console.print("[dim]Exchanging authorization code...[/dim]")
+                try:
+                    token = exchange_code(result.code, api_url)
+                except AuthError as e:
+                    console.print(f"[bold red]Error:[/bold red] {e}")
 
     # --- Attempt 2: Manual paste fallback ---
     if token is None:
