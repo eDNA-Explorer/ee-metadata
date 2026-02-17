@@ -1,6 +1,7 @@
 import gzip
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -9,6 +10,14 @@ import typer
 from dateutil import parser as date_parser
 from rapidfuzz import fuzz
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TransferSpeedColumn,
+)
 from rich.table import Table
 
 from ee_metadata.auth import (
@@ -25,6 +34,12 @@ from ee_metadata.auth import (
     start_callback_server,
     validate_token,
     wait_for_callback,
+)
+from ee_metadata.upload import (
+    UploadError,
+    get_allowed_filenames,
+    match_local_files,
+    upload_file,
 )
 
 # Initialize Typer app and Rich console for nice terminal output
@@ -1193,9 +1208,7 @@ def login(
 
             browser_opened = open_browser(auth_url)
             if not browser_opened:
-                console.print(
-                    "[yellow]Could not open browser automatically.[/yellow]"
-                )
+                console.print("[yellow]Could not open browser automatically.[/yellow]")
                 console.print("Please open the URL above manually.\n")
 
             console.print("[dim]Waiting for authorization...[/dim]\n")
@@ -1285,12 +1298,18 @@ def upload(
         "--dry-run",
         help="Show what would be uploaded without actually uploading.",
     ),
+    concurrency: int = typer.Option(
+        4,
+        "--concurrency",
+        "-c",
+        min=1,
+        max=8,
+        help="Number of concurrent uploads (1-8).",
+    ),
 ):
     """Upload FASTQ files to eDNA Explorer.
 
     Requires authentication. Run 'ee-metadata login' first.
-
-    Note: Full upload functionality is coming soon.
     """
     # Validate directory exists
     if not directory.exists():
@@ -1331,7 +1350,7 @@ def upload(
     console.print(f"[bold green]✓ Authenticated as {display_name}[/bold green]\n")
 
     # Scan for FASTQ files
-    files = list(directory.glob("*.fastq.gz"))
+    files = sorted(directory.glob("*.fastq.gz"))
     if not files:
         console.print(
             f"[bold yellow]Warning:[/bold yellow] No .fastq.gz files found in "
@@ -1339,26 +1358,137 @@ def upload(
         )
         raise typer.Exit(code=0)
 
-    # Show file info
-    total_size = sum(f.stat().st_size for f in files)
-    size_str = (
-        f"{total_size / (1024 * 1024):.1f} MB"
-        if total_size >= 1024 * 1024
-        else f"{total_size / 1024:.1f} KB"
-    )
+    # Fetch allowed filenames from server
+    console.print("[dim]Fetching project file list...[/dim]")
+    try:
+        project_info = get_allowed_filenames(
+            project, token_data.token, token_data.api_url
+        )
+    except (UploadError, AuthError) as e:
+        console.print(f"[bold red]Error:[/bold red] {e}")
+        raise typer.Exit(code=1) from None
 
-    console.print(f"[bold cyan]Directory:[/bold cyan] {directory}")
-    console.print(f"[bold cyan]Project:[/bold cyan] {project}")
+    # Match local files against server list
+    match_result = match_local_files(files, project_info.allowed_files)
+
+    # Display upload plan table
+    table = Table(title="Upload Plan")
+    table.add_column("File", style="cyan")
+    table.add_column("Status", style="bold")
+    table.add_column("Size")
+
+    def _format_size(size_bytes: int) -> str:
+        if size_bytes >= 1024 * 1024 * 1024:
+            return f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
+        if size_bytes >= 1024 * 1024:
+            return f"{size_bytes / (1024 * 1024):.1f} MB"
+        return f"{size_bytes / 1024:.1f} KB"
+
+    for local_path, _af in match_result.matched:
+        size = _format_size(local_path.stat().st_size)
+        table.add_row(local_path.name, "[green]Ready to upload[/green]", size)
+
+    for local_path, _af in match_result.already_uploaded:
+        size = _format_size(local_path.stat().st_size)
+        table.add_row(local_path.name, "[yellow]Already uploaded[/yellow]", size)
+
+    for local_path in match_result.unmatched_local:
+        size = _format_size(local_path.stat().st_size)
+        table.add_row(local_path.name, "[red]Not in project[/red]", size)
+
+    for af in match_result.unmatched_server:
+        table.add_row(
+            af.file_name or af.normalized_name, "[dim]Missing locally[/dim]", "-"
+        )
+
+    console.print(table)
+
+    if not match_result.matched:
+        console.print("\n[yellow]No new files to upload.[/yellow]")
+        raise typer.Exit(code=0)
+
+    # Summary line
+    upload_size = sum(p.stat().st_size for p, _ in match_result.matched)
     console.print(
-        f"[bold cyan]Files:[/bold cyan] {len(files)} FASTQ files ({size_str})"
+        f"\n[bold]{len(match_result.matched)} file(s)[/bold] to upload "
+        f"({_format_size(upload_size)})"
     )
 
+    # Dry-run exits here
     if dry_run:
-        console.print("\n[dim]Files that would be uploaded:[/dim]")
-        for f in sorted(files):
-            console.print(f"  {f.name}")
+        console.print("[dim]Dry run — nothing was uploaded.[/dim]")
+        raise typer.Exit(code=0)
 
-    console.print("\n[bold yellow]Upload functionality coming soon![/bold yellow]")
+    # Confirm upload
+    if not typer.confirm("Proceed with upload?"):
+        console.print("[dim]Upload cancelled.[/dim]")
+        raise typer.Exit(code=0)
+
+    # Concurrent upload with Rich Progress
+    results: list = []
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(),
+        DownloadColumn(),
+        TransferSpeedColumn(),
+        console=console,
+    ) as progress:
+        # Overall progress bar
+        overall_task = progress.add_task("Overall", total=upload_size)
+
+        # Map futures to their progress task IDs
+        future_to_info: dict = {}
+
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            for local_path, af in match_result.matched:
+                file_size = local_path.stat().st_size
+                task_id = progress.add_task(local_path.name, total=file_size)
+
+                def _make_callback(tid, overall_tid):
+                    def _cb(bytes_uploaded: int):
+                        progress.advance(tid, bytes_uploaded)
+                        progress.advance(overall_tid, bytes_uploaded)
+
+                    return _cb
+
+                future = executor.submit(
+                    upload_file,
+                    filepath=local_path,
+                    allowed_file=af,
+                    project_id=project,
+                    project_metadata_id=project_info.project_metadata_id,
+                    token=token_data.token,
+                    api_url=token_data.api_url,
+                    progress_callback=_make_callback(task_id, overall_task),
+                )
+                future_to_info[future] = (local_path.name, task_id)
+
+            for future in as_completed(future_to_info):
+                result = future.result()
+                results.append(result)
+                _name, tid = future_to_info[future]
+                if result.success:
+                    progress.update(tid, description=f"[green]✓[/green] {_name}")
+                else:
+                    progress.update(tid, description=f"[red]✗[/red] {_name}")
+
+    # Summary
+    succeeded = sum(1 for r in results if r.success)
+    failed = sum(1 for r in results if not r.success)
+
+    console.print()
+    if succeeded:
+        console.print(
+            f"[bold green]✓ {succeeded} file(s) uploaded successfully[/bold green]"
+        )
+    if failed:
+        console.print(f"[bold red]✗ {failed} file(s) failed:[/bold red]")
+        for r in results:
+            if not r.success:
+                console.print(f"  {r.filename}: {r.error}")
+        raise typer.Exit(code=1)
 
 
 # =============================================================================
