@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import tempfile
 from pathlib import Path
+from threading import Event
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -17,6 +18,7 @@ from ee_metadata.upload import (
     SignedUrlResponse,
     TokenExpiredUploadError,
     UploadError,
+    _retry_transient,
     _streaming_upload_with_hash,
     get_allowed_filenames,
     match_local_files,
@@ -402,6 +404,106 @@ class TestReuploadMatching:
 
         assert len(result.needs_reupload) == 0
         assert len(result.already_uploaded) == 1
+
+
+# ---------------------------------------------------------------------------
+# Retry helper tests
+# ---------------------------------------------------------------------------
+
+
+class TestRetryTransient:
+    @patch("ee_metadata.upload.time.sleep")
+    def test_retries_transient_then_succeeds(self, mock_sleep):
+        """First call raises transient error, second succeeds."""
+        call_count = 0
+
+        def _flaky(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise UploadError("Server returned status 500: Internal Server Error")
+            return "ok"
+
+        result = _retry_transient(_flaky, max_retries=3)
+
+        assert result == "ok"
+        assert call_count == 2
+        mock_sleep.assert_called_once()
+
+    @patch("ee_metadata.upload.time.sleep")
+    def test_no_retry_on_permission_error(self, mock_sleep):
+        """Permission errors are not retried."""
+        call_count = 0
+
+        def _perm_error(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            raise UploadError("You don't have permission to upload to this project.")
+
+        with pytest.raises(UploadError, match="permission"):
+            _retry_transient(_perm_error, max_retries=3)
+
+        assert call_count == 1
+        mock_sleep.assert_not_called()
+
+    @patch("ee_metadata.upload.time.sleep")
+    def test_no_retry_on_not_found_error(self, mock_sleep):
+        """Not found errors are not retried."""
+        call_count = 0
+
+        def _not_found(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            raise UploadError("Project 'xyz' not found.")
+
+        with pytest.raises(UploadError, match="not found"):
+            _retry_transient(_not_found, max_retries=3)
+
+        assert call_count == 1
+        mock_sleep.assert_not_called()
+
+    def test_no_retry_on_token_expired(self):
+        """TokenExpiredUploadError is never retried."""
+        call_count = 0
+
+        def _expired(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            raise TokenExpiredUploadError("Token expired")
+
+        with pytest.raises(TokenExpiredUploadError):
+            _retry_transient(_expired, max_retries=3)
+
+        assert call_count == 1
+
+    @patch("ee_metadata.upload.time.sleep")
+    def test_cancel_event_aborts_retry(self, mock_sleep):
+        """If cancel_event is set, retry bails immediately."""
+        cancel = Event()
+        cancel.set()
+
+        def _should_not_run(*args, **kwargs):
+            raise AssertionError("Should not be called")
+
+        with pytest.raises(TokenExpiredUploadError, match="cancelled"):
+            _retry_transient(_should_not_run, cancel_event=cancel)
+
+    @patch("ee_metadata.upload.time.sleep")
+    def test_retries_auth_error(self, mock_sleep):
+        """AuthError (connection errors) are retried."""
+        call_count = 0
+
+        def _conn_error(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise AuthError("Failed to connect")
+            return "connected"
+
+        result = _retry_transient(_conn_error, max_retries=3)
+
+        assert result == "connected"
+        assert call_count == 3
 
 
 # ---------------------------------------------------------------------------

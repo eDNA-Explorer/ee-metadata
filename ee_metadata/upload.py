@@ -6,6 +6,7 @@ Handles uploading FASTQ files to eDNA Explorer via pre-signed GCS URLs.
 from __future__ import annotations
 
 import hashlib
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -14,6 +15,7 @@ import httpx
 
 if TYPE_CHECKING:
     from pathlib import Path
+    from threading import Event
 
 from ee_metadata.auth import AuthError
 
@@ -25,6 +27,10 @@ UPLOAD_TIMEOUT = 3600.0  # 1 hour for large file uploads
 API_TIMEOUT = 30.0
 HASH_CHUNK_SIZE = 8 * 1024 * 1024  # 8 MB
 UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024  # 8 MB
+
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 1.0
+RETRY_MAX_DELAY = 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +370,45 @@ def match_local_files(
         unmatched_local=unmatched_local,
         unmatched_server=unmatched_server,
     )
+
+
+# ---------------------------------------------------------------------------
+# Retry helper
+# ---------------------------------------------------------------------------
+
+
+def _retry_transient(
+    fn: Callable,
+    *args,
+    max_retries: int = MAX_RETRIES,
+    cancel_event: Event | None = None,
+    **kwargs,
+):
+    """Retry *fn* on transient errors with exponential backoff.
+
+    Never retries ``TokenExpiredUploadError`` (401) or client errors
+    containing "permission" / "not found" (403/404). Bails immediately
+    if *cancel_event* is set.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        if cancel_event is not None and cancel_event.is_set():
+            raise TokenExpiredUploadError("Upload cancelled: token expired.")
+        try:
+            return fn(*args, **kwargs)
+        except TokenExpiredUploadError:
+            raise
+        except UploadError as e:
+            msg = str(e).lower()
+            if "permission" in msg or "not found" in msg:
+                raise
+            last_exc = e
+        except AuthError as e:
+            last_exc = e
+        if attempt < max_retries:
+            delay = min(RETRY_BASE_DELAY * (2**attempt), RETRY_MAX_DELAY)
+            time.sleep(delay)
+    raise last_exc  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------
