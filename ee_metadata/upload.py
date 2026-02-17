@@ -36,6 +36,10 @@ class UploadError(Exception):
     """Base exception for upload failures."""
 
 
+class TokenExpiredUploadError(UploadError):
+    """Raised when an API call during upload returns 401 (token expired)."""
+
+
 # ---------------------------------------------------------------------------
 # Data types
 # ---------------------------------------------------------------------------
@@ -50,6 +54,7 @@ class AllowedFile:
     sample_id: str
     uploaded: bool
     md5_checksum: str | None
+    note_type: str | None = None
 
 
 @dataclass
@@ -78,6 +83,7 @@ class UploadResult:
     error: str | None = None
     checksum: str | None = None
     filesize: int = 0
+    skipped: bool = False
 
 
 @dataclass
@@ -136,6 +142,7 @@ def get_allowed_filenames(
             sample_id=f.get("sampleId", ""),
             uploaded=f.get("uploaded", False),
             md5_checksum=f.get("md5CheckSum"),
+            note_type=f.get("noteType"),
         )
         for f in data.get("allowedFilenames", [])
     ]
@@ -170,7 +177,9 @@ def get_signed_url(
         raise AuthError(f"Failed to connect to {api_url}: {e}") from e
 
     if response.status_code == 401:
-        raise UploadError("Authentication failed. Run 'ee-metadata login' again.")
+        raise TokenExpiredUploadError(
+            "Token expired during upload. Run 'ee-metadata login' again."
+        )
     if response.status_code == 403:
         raise UploadError("You don't have permission to upload to this project.")
     if response.status_code != 200:
@@ -222,7 +231,9 @@ def complete_upload(
         raise AuthError(f"Failed to connect to {api_url}: {e}") from e
 
     if response.status_code == 401:
-        raise UploadError("Authentication failed. Run 'ee-metadata login' again.")
+        raise TokenExpiredUploadError(
+            "Token expired during upload. Run 'ee-metadata login' again."
+        )
     if response.status_code != 200:
         raise UploadError(
             f"Upload completion failed ({response.status_code}): {response.text}"

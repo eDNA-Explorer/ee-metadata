@@ -15,6 +15,7 @@ from ee_metadata.upload import (
     AllowedFile,
     ProjectUploadInfo,
     SignedUrlResponse,
+    TokenExpiredUploadError,
     UploadError,
     _streaming_upload_with_hash,
     get_allowed_filenames,
@@ -36,6 +37,7 @@ def _make_allowed(
     sample_id: str = "",
     uploaded: bool = False,
     normalized: str | None = None,
+    note_type: str | None = None,
 ) -> AllowedFile:
     return AllowedFile(
         normalized_name=normalized or name,
@@ -43,6 +45,7 @@ def _make_allowed(
         sample_id=sample_id or name,
         uploaded=uploaded,
         md5_checksum=None,
+        note_type=note_type,
     )
 
 
@@ -357,3 +360,66 @@ class TestUploadFile:
         assert "no permission" in result.error
 
         filepath.unlink()
+
+
+# ---------------------------------------------------------------------------
+# noteType parsing test
+# ---------------------------------------------------------------------------
+
+
+class TestParseNoteType:
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_parse_note_type(self, mock_client_cls):
+        """Server response with noteType='REUPLOAD' sets AllowedFile.note_type."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        mock_client.get.return_value = _mock_response(
+            200,
+            {
+                "allowedFilenames": [
+                    {
+                        "normalizedName": "s1.fastq.gz",
+                        "fileName": "s1.fastq.gz",
+                        "sampleId": "abc",
+                        "uploaded": True,
+                        "md5CheckSum": "abc123",
+                        "noteType": "REUPLOAD",
+                    }
+                ],
+                "projectMetadataId": "pm-1",
+            },
+        )
+
+        result = get_allowed_filenames(PROJECT_ID, TOKEN, API_URL)
+
+        assert result.allowed_files[0].note_type == "REUPLOAD"
+        assert result.allowed_files[0].uploaded is True
+
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_parse_note_type_null(self, mock_client_cls):
+        """Server response without noteType sets AllowedFile.note_type to None."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        mock_client.get.return_value = _mock_response(
+            200,
+            {
+                "allowedFilenames": [
+                    {
+                        "normalizedName": "s1.fastq.gz",
+                        "fileName": "s1.fastq.gz",
+                        "sampleId": "abc",
+                        "uploaded": False,
+                        "md5CheckSum": None,
+                    }
+                ],
+                "projectMetadataId": "pm-1",
+            },
+        )
+
+        result = get_allowed_filenames(PROJECT_ID, TOKEN, API_URL)
+
+        assert result.allowed_files[0].note_type is None
