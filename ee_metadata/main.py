@@ -3,6 +3,7 @@ import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import Event
 from typing import Any, Dict, List, Optional, Tuple
 
 import polars as pl
@@ -1371,6 +1372,9 @@ def upload(
     # Match local files against server list
     match_result = match_local_files(files, project_info.allowed_files)
 
+    # Build upload queue: new files + files that need re-upload
+    upload_queue = match_result.matched + match_result.needs_reupload
+
     # Display upload plan table
     table = Table(title="Upload Plan")
     table.add_column("File", style="cyan")
@@ -1388,9 +1392,15 @@ def upload(
         size = _format_size(local_path.stat().st_size)
         table.add_row(local_path.name, "[green]Ready to upload[/green]", size)
 
+    for local_path, _af in match_result.needs_reupload:
+        size = _format_size(local_path.stat().st_size)
+        table.add_row(
+            local_path.name, "[yellow]Re-upload (verify failed)[/yellow]", size
+        )
+
     for local_path, _af in match_result.already_uploaded:
         size = _format_size(local_path.stat().st_size)
-        table.add_row(local_path.name, "[yellow]Already uploaded[/yellow]", size)
+        table.add_row(local_path.name, "[dim]Already uploaded[/dim]", size)
 
     for local_path in match_result.unmatched_local:
         size = _format_size(local_path.stat().st_size)
@@ -1403,14 +1413,14 @@ def upload(
 
     console.print(table)
 
-    if not match_result.matched:
+    if not upload_queue:
         console.print("\n[yellow]No new files to upload.[/yellow]")
         raise typer.Exit(code=0)
 
     # Summary line
-    upload_size = sum(p.stat().st_size for p, _ in match_result.matched)
+    upload_size = sum(p.stat().st_size for p, _ in upload_queue)
     console.print(
-        f"\n[bold]{len(match_result.matched)} file(s)[/bold] to upload "
+        f"\n[bold]{len(upload_queue)} file(s)[/bold] to upload "
         f"({_format_size(upload_size)})"
     )
 
@@ -1426,6 +1436,7 @@ def upload(
 
     # Concurrent upload with Rich Progress
     results: list = []
+    cancel_event = Event()
 
     with Progress(
         SpinnerColumn(),
@@ -1442,7 +1453,7 @@ def upload(
         future_to_info: dict = {}
 
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            for local_path, af in match_result.matched:
+            for local_path, af in upload_queue:
                 file_size = local_path.stat().st_size
                 task_id = progress.add_task(local_path.name, total=file_size)
 
@@ -1462,6 +1473,7 @@ def upload(
                     token=token_data.token,
                     api_url=token_data.api_url,
                     progress_callback=_make_callback(task_id, overall_task),
+                    cancel_event=cancel_event,
                 )
                 future_to_info[future] = (local_path.name, task_id)
 
@@ -1471,23 +1483,39 @@ def upload(
                 _name, tid = future_to_info[future]
                 if result.success:
                     progress.update(tid, description=f"[green]✓[/green] {_name}")
+                elif result.skipped:
+                    progress.update(tid, description=f"[yellow]—[/yellow] {_name}")
                 else:
                     progress.update(tid, description=f"[red]✗[/red] {_name}")
 
     # Summary
     succeeded = sum(1 for r in results if r.success)
-    failed = sum(1 for r in results if not r.success)
+    failed = sum(1 for r in results if not r.success and not r.skipped)
+    skipped = sum(1 for r in results if r.skipped)
 
     console.print()
     if succeeded:
         console.print(
             f"[bold green]✓ {succeeded} file(s) uploaded successfully[/bold green]"
         )
+    if skipped:
+        console.print(
+            f"[bold yellow]— {skipped} file(s) skipped (token expired)[/bold yellow]"
+        )
     if failed:
         console.print(f"[bold red]✗ {failed} file(s) failed:[/bold red]")
         for r in results:
-            if not r.success:
+            if not r.success and not r.skipped:
                 console.print(f"  {r.filename}: {r.error}")
+
+    if cancel_event.is_set():
+        console.print(
+            "\n[bold yellow]Session expired during upload.[/bold yellow] "
+            "Run [bold]ee-metadata login[/bold] then re-run this command. "
+            "Already-uploaded files will be skipped automatically."
+        )
+
+    if failed or cancel_event.is_set():
         raise typer.Exit(code=1)
 
 
