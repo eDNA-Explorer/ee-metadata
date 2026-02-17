@@ -363,6 +363,48 @@ class TestUploadFile:
 
 
 # ---------------------------------------------------------------------------
+# REUPLOAD matching tests
+# ---------------------------------------------------------------------------
+
+
+class TestReuploadMatching:
+    def test_reupload_files_in_needs_reupload(self):
+        """File with uploaded=True and note_type='REUPLOAD' goes to needs_reupload."""
+        local = [Path("sample1.fastq.gz")]
+        allowed = [
+            _make_allowed("sample1.fastq.gz", "s1", uploaded=True, note_type="REUPLOAD")
+        ]
+
+        result = match_local_files(local, allowed)
+
+        assert len(result.needs_reupload) == 1
+        assert len(result.already_uploaded) == 0
+        assert len(result.matched) == 0
+
+    def test_uploaded_without_reupload_stays_in_already_uploaded(self):
+        """File with uploaded=True and no note_type stays in already_uploaded."""
+        local = [Path("sample1.fastq.gz")]
+        allowed = [_make_allowed("sample1.fastq.gz", "s1", uploaded=True)]
+
+        result = match_local_files(local, allowed)
+
+        assert len(result.needs_reupload) == 0
+        assert len(result.already_uploaded) == 1
+
+    def test_uploaded_with_warning_stays_in_already_uploaded(self):
+        """File with uploaded=True and note_type='WARNING' stays in already_uploaded."""
+        local = [Path("sample1.fastq.gz")]
+        allowed = [
+            _make_allowed("sample1.fastq.gz", "s1", uploaded=True, note_type="WARNING")
+        ]
+
+        result = match_local_files(local, allowed)
+
+        assert len(result.needs_reupload) == 0
+        assert len(result.already_uploaded) == 1
+
+
+# ---------------------------------------------------------------------------
 # noteType parsing test
 # ---------------------------------------------------------------------------
 

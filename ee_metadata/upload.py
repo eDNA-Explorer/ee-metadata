@@ -311,6 +311,7 @@ class MatchResult:
 
     matched: list[tuple[Path, AllowedFile]]
     already_uploaded: list[tuple[Path, AllowedFile]]
+    needs_reupload: list[tuple[Path, AllowedFile]]
     unmatched_local: list[Path]
     unmatched_server: list[AllowedFile]
 
@@ -324,6 +325,7 @@ def match_local_files(
     """
     matched: list[tuple[Path, AllowedFile]] = []
     already_uploaded: list[tuple[Path, AllowedFile]] = []
+    needs_reupload: list[tuple[Path, AllowedFile]] = []
     unmatched_local: list[Path] = []
 
     # Index allowed files by both name forms for O(1) lookup
@@ -343,6 +345,9 @@ def match_local_files(
 
         if af is None:
             unmatched_local.append(local_path)
+        elif af.uploaded and af.note_type == "REUPLOAD":
+            needs_reupload.append((local_path, af))
+            matched_server_files.add(af.file_name)
         elif af.uploaded:
             already_uploaded.append((local_path, af))
             matched_server_files.add(af.file_name)
@@ -355,6 +360,7 @@ def match_local_files(
     return MatchResult(
         matched=matched,
         already_uploaded=already_uploaded,
+        needs_reupload=needs_reupload,
         unmatched_local=unmatched_local,
         unmatched_server=unmatched_server,
     )
