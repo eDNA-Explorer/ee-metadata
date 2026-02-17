@@ -407,6 +407,101 @@ class TestReuploadMatching:
 
 
 # ---------------------------------------------------------------------------
+# Circuit breaker & cancel_event tests
+# ---------------------------------------------------------------------------
+
+
+class TestCircuitBreaker:
+    def test_cancel_event_skips_upload(self):
+        """Pre-set cancel event causes upload_file to return skipped=True immediately."""
+        filepath = _tmp_file(b"data")
+        af = _make_allowed(filepath.name, "s1")
+        cancel = Event()
+        cancel.set()
+
+        result = upload_file(
+            filepath=filepath,
+            allowed_file=af,
+            project_id=PROJECT_ID,
+            project_metadata_id="pm-1",
+            token=TOKEN,
+            api_url=API_URL,
+            cancel_event=cancel,
+        )
+
+        assert not result.success
+        assert result.skipped
+
+        filepath.unlink()
+
+    @patch("ee_metadata.upload._streaming_upload_with_hash")
+    @patch("ee_metadata.upload.get_signed_url")
+    def test_401_sets_cancel_event(self, mock_get_url, mock_stream):
+        """TokenExpiredUploadError from get_signed_url sets the cancel_event."""
+        filepath = _tmp_file(b"data")
+        af = _make_allowed(filepath.name, "s1")
+        cancel = Event()
+
+        mock_get_url.side_effect = TokenExpiredUploadError("Token expired")
+
+        result = upload_file(
+            filepath=filepath,
+            allowed_file=af,
+            project_id=PROJECT_ID,
+            project_metadata_id="pm-1",
+            token=TOKEN,
+            api_url=API_URL,
+            cancel_event=cancel,
+        )
+
+        assert not result.success
+        assert not result.skipped  # First failure is not "skipped", it's the trigger
+        assert cancel.is_set()
+        mock_stream.assert_not_called()
+
+        filepath.unlink()
+
+    @patch("ee_metadata.upload.complete_upload")
+    @patch("ee_metadata.upload._streaming_upload_with_hash")
+    @patch("ee_metadata.upload.get_signed_url")
+    def test_cancel_after_gcs_put_skips_complete(
+        self, mock_get_url, mock_stream, mock_complete
+    ):
+        """If cancel_event is set after GCS PUT, complete_upload is skipped."""
+        filepath = _tmp_file(b"data")
+        af = _make_allowed(filepath.name, "s1")
+        cancel = Event()
+
+        mock_get_url.return_value = SignedUrlResponse(
+            signed_url="https://gcs.example.com/upload",
+            sample_id="s1",
+            file_id="f1",
+        )
+
+        def _set_cancel_and_return(*args, **kwargs):
+            cancel.set()
+            return ("abc123hash", 4)
+
+        mock_stream.side_effect = _set_cancel_and_return
+
+        result = upload_file(
+            filepath=filepath,
+            allowed_file=af,
+            project_id=PROJECT_ID,
+            project_metadata_id="pm-1",
+            token=TOKEN,
+            api_url=API_URL,
+            cancel_event=cancel,
+        )
+
+        assert not result.success
+        assert result.skipped
+        mock_complete.assert_not_called()
+
+        filepath.unlink()
+
+
+# ---------------------------------------------------------------------------
 # Retry helper tests
 # ---------------------------------------------------------------------------
 

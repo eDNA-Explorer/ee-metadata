@@ -424,24 +424,45 @@ def upload_file(
     token: str,
     api_url: str,
     progress_callback: ProgressCallback | None = None,
+    cancel_event: Event | None = None,
 ) -> UploadResult:
     """Upload a single file: get signed URL → stream upload → complete.
 
     This function is designed to be called from a thread pool.
+    When *cancel_event* is set (by any thread detecting a 401), remaining
+    files are skipped immediately rather than failing one-by-one.
     """
     filename = filepath.name
 
+    # Circuit breaker: skip immediately if another thread tripped the flag
+    if cancel_event is not None and cancel_event.is_set():
+        return UploadResult(filename=filename, success=False, skipped=True)
+
     try:
-        # 1. Get a signed upload URL (just-in-time to avoid expiry)
-        signed = get_signed_url(project_id, filename, token, api_url)
+        # 1. Get a signed upload URL (with retry for transient errors)
+        signed = _retry_transient(
+            get_signed_url,
+            project_id,
+            filename,
+            token,
+            api_url,
+            cancel_event=cancel_event,
+        )
 
         # 2. Stream upload while computing hash
+        # GCS signed URLs are self-authenticating — no cancel check here
+        # so in-progress uploads can finish even after token expiry.
         checksum, filesize = _streaming_upload_with_hash(
             filepath, signed.signed_url, progress_callback
         )
 
-        # 3. Notify server of completion
-        complete_upload(
+        # 3. Check cancel_event after GCS PUT — complete_upload needs JWT
+        if cancel_event is not None and cancel_event.is_set():
+            return UploadResult(filename=filename, success=False, skipped=True)
+
+        # 4. Notify server of completion (with retry for transient errors)
+        _retry_transient(
+            complete_upload,
             project_metadata_id=project_metadata_id,
             sample_id=signed.sample_id,
             filename=filename,
@@ -449,8 +470,14 @@ def upload_file(
             filesize=filesize,
             token=token,
             api_url=api_url,
+            cancel_event=cancel_event,
         )
 
+    except TokenExpiredUploadError as e:
+        # Trip the circuit breaker for all threads
+        if cancel_event is not None:
+            cancel_event.set()
+        return UploadResult(filename=filename, success=False, error=str(e))
     except (UploadError, AuthError) as e:
         return UploadResult(filename=filename, success=False, error=str(e))
 
