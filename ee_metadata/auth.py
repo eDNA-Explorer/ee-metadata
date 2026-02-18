@@ -179,6 +179,11 @@ def decode_token_claims(token: str) -> dict:
 
     Used to extract state claim before server-side validation.
 
+    NOTE: This is a UX guard (detecting wrong-session tokens or paste errors),
+    NOT a security boundary. The actual signature verification happens
+    server-side in validate_token(). Do not rely on these claims for
+    authorization decisions.
+
     Args:
         token: JWT token string
 
