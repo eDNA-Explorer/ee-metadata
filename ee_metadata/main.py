@@ -22,6 +22,7 @@ from rich.progress import (
 from rich.table import Table
 
 from ee_metadata.auth import (
+    DEFAULT_API_URL,
     AuthError,
     TokenExpiredError,
     TokenNotFoundError,
@@ -1202,6 +1203,12 @@ def login(
     """
     state = generate_state()
     console.print("\n[bold cyan]eDNA Explorer Login[/bold cyan]\n")
+
+    if api_url.rstrip("/") != DEFAULT_API_URL.rstrip("/"):
+        console.print(
+            f"[bold yellow]Warning:[/bold yellow] Using non-default API URL: {api_url}\n"
+            "Make sure you trust this server before authenticating.\n"
+        )
 
     token = None
     from_device = False
