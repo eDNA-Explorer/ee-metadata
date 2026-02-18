@@ -28,14 +28,17 @@ from ee_metadata.auth import (
     decode_token_claims,
     exchange_code,
     generate_state,
+    is_token_expiring_soon,
     open_browser,
     poll_device_token,
+    refresh_access_token,
     request_device_code,
     start_callback_server,
     validate_token,
     wait_for_callback,
 )
 from ee_metadata.token_storage import (
+    TokenData,
     clear_token,
     get_token,
     storage_info,
@@ -1175,6 +1178,24 @@ def classify_sample_type(type_str: str) -> bool:
 # =============================================================================
 
 
+def ensure_valid_token(token_data: TokenData) -> TokenData:
+    """If access token is expiring soon and a refresh token exists,
+    refresh transparently."""
+    if not is_token_expiring_soon(token_data.token):
+        return token_data
+    if not token_data.refresh_token:
+        return token_data  # Let validate_token() catch the expiry
+    try:
+        new_access, new_refresh = refresh_access_token(
+            token_data.refresh_token, token_data.api_url
+        )
+        store_token(new_access, token_data.api_url, refresh_token=new_refresh)
+        console.print("[dim]Token refreshed automatically[/dim]")
+        return get_token()
+    except (AuthError, TokenExpiredError):
+        return token_data  # Let validate_token() catch the expiry
+
+
 @app.command()
 def login(
     api_url: str = typer.Option(
@@ -1218,6 +1239,7 @@ def login(
         )
 
     token = None
+    refresh_token = None
     from_device = False
 
     # --- Attempt 1: Automatic browser flow ---
@@ -1250,7 +1272,9 @@ def login(
                     # Exchange the short-lived code for a full token
                     console.print("[dim]Exchanging authorization code...[/dim]")
                     try:
-                        token = exchange_code(result.code, api_url)
+                        exchange_result = exchange_code(result.code, api_url)
+                        token = exchange_result.token
+                        refresh_token = exchange_result.refresh_token
                     except AuthError as e:
                         console.print(f"[bold red]Error:[/bold red] {e}")
 
@@ -1273,12 +1297,14 @@ def login(
             )
 
             with console.status("Waiting for authorization..."):
-                token = poll_device_token(
+                poll_result = poll_device_token(
                     device_code=device_resp.device_code,
                     api_url=api_url,
                     interval=device_resp.interval,
                     expires_in=device_resp.expires_in,
                 )
+            token = poll_result.token
+            refresh_token = poll_result.refresh_token
             from_device = True
         except AuthError as e:
             console.print(f"[bold red]Error:[/bold red] {e}\n")
@@ -1319,7 +1345,9 @@ def login(
 
     try:
         user = validate_token(token, api_url)
-        method = store_token(token, api_url, insecure=insecure_storage)
+        method = store_token(
+            token, api_url, insecure=insecure_storage, refresh_token=refresh_token
+        )
         display_name = user.name or user.email
         console.print(f"\n[bold green]✓ Logged in as {display_name}[/bold green]")
         console.print(f"[dim]Email: {user.email}[/dim]")
@@ -1365,6 +1393,7 @@ def auth_status():
 
     token_data = get_token()
     if token_data is not None:
+        token_data = ensure_valid_token(token_data)
         table.add_row("Authenticated", "[green]yes[/green]")
         table.add_row("API URL", token_data.api_url)
         try:
@@ -1427,6 +1456,9 @@ def upload(
             "Run 'ee-metadata login' to authenticate."
         )
         raise typer.Exit(code=1)
+
+    # Refresh token transparently if expiring soon
+    token_data = ensure_valid_token(token_data)
 
     # Validate token is still valid
     console.print("[dim]Checking authentication...[/dim]")
