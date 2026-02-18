@@ -1568,66 +1568,72 @@ def upload(
     cancel_event = Event()
     interrupted = False
 
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(),
+        DownloadColumn(),
+        TransferSpeedColumn(),
+        console=console,
+    )
+    progress.start()
+    executor = ThreadPoolExecutor(max_workers=concurrency)
+
     try:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(),
-            DownloadColumn(),
-            TransferSpeedColumn(),
-            console=console,
-        ) as progress:
-            # Overall progress bar
-            overall_task = progress.add_task("Overall", total=upload_size)
+        # Overall progress bar
+        overall_task = progress.add_task("Overall", total=upload_size)
 
-            # Map futures to their progress task IDs
-            future_to_info: dict = {}
+        # Map futures to their progress task IDs
+        future_to_info: dict = {}
 
-            with ThreadPoolExecutor(max_workers=concurrency) as executor:
-                for local_path, af in upload_queue:
-                    file_size = local_path.stat().st_size
-                    task_id = progress.add_task(local_path.name, total=file_size)
+        for local_path, af in upload_queue:
+            file_size = local_path.stat().st_size
+            task_id = progress.add_task(local_path.name, total=file_size)
 
-                    def _make_callback(tid, overall_tid):
-                        def _cb(bytes_uploaded: int):
-                            progress.advance(tid, bytes_uploaded)
-                            progress.advance(overall_tid, bytes_uploaded)
+            def _make_callback(tid, overall_tid):
+                def _cb(bytes_uploaded: int):
+                    progress.advance(tid, bytes_uploaded)
+                    progress.advance(overall_tid, bytes_uploaded)
 
-                        return _cb
+                return _cb
 
-                    future = executor.submit(
-                        upload_file,
-                        filepath=local_path,
-                        allowed_file=af,
-                        project_id=project,
-                        project_metadata_id=project_info.project_metadata_id,
-                        token=token_data.token,
-                        api_url=token_data.api_url,
-                        progress_callback=_make_callback(task_id, overall_task),
-                        cancel_event=cancel_event,
-                    )
-                    future_to_info[future] = (local_path.name, task_id)
+            future = executor.submit(
+                upload_file,
+                filepath=local_path,
+                allowed_file=af,
+                project_id=project,
+                project_metadata_id=project_info.project_metadata_id,
+                token=token_data.token,
+                api_url=token_data.api_url,
+                progress_callback=_make_callback(task_id, overall_task),
+                cancel_event=cancel_event,
+            )
+            future_to_info[future] = (local_path.name, task_id)
 
-                for future in as_completed(future_to_info):
-                    result = future.result()
-                    results.append(result)
-                    _name, tid = future_to_info[future]
-                    if result.success:
-                        progress.update(
-                            tid, description=f"[green]✓[/green] {_name}"
-                        )
-                    elif result.skipped:
-                        progress.update(
-                            tid, description=f"[yellow]—[/yellow] {_name}"
-                        )
-                    else:
-                        progress.update(
-                            tid, description=f"[red]✗[/red] {_name}"
-                        )
+        for future in as_completed(future_to_info):
+            result = future.result()
+            results.append(result)
+            _name, tid = future_to_info[future]
+            if result.success:
+                progress.update(
+                    tid, description=f"[green]✓[/green] {_name}"
+                )
+            elif result.skipped:
+                progress.update(
+                    tid, description=f"[yellow]—[/yellow] {_name}"
+                )
+            else:
+                progress.update(
+                    tid, description=f"[red]✗[/red] {_name}"
+                )
     except KeyboardInterrupt:
         interrupted = True
         cancel_event.set()
-        console.print("\n[bold yellow]Upload cancelled by user.[/bold yellow]")
+    finally:
+        progress.stop()
+        executor.shutdown(wait=not interrupted, cancel_futures=interrupted)
+        if interrupted:
+            console.print("\n[bold yellow]Upload cancelled by user.[/bold yellow]")
 
     # Summary
     succeeded = sum(1 for r in results if r.success)
