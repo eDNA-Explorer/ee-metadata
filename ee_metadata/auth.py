@@ -8,6 +8,7 @@ import json
 import secrets
 import stat
 import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -47,6 +48,17 @@ class UserInfo(NamedTuple):
     id: str
     email: str
     name: str
+
+
+class DeviceCodeResponse(NamedTuple):
+    """Response from the device code request endpoint."""
+
+    device_code: str
+    user_code: str
+    verification_uri: str
+    verification_uri_complete: str
+    expires_in: int
+    interval: int
 
 
 def get_token_path() -> Path:
@@ -332,6 +344,120 @@ def exchange_code(code: str, api_url: str) -> str:
         raise AuthError(f"Failed to connect to {api_url}: {e}") from e
 
     return token
+
+
+# =============================================================================
+# Device Authorization Flow (RFC 8628)
+# =============================================================================
+
+
+def request_device_code(api_url: str) -> DeviceCodeResponse:
+    """Request a device code for the device authorization flow.
+
+    Args:
+        api_url: Base URL of the API
+
+    Returns:
+        DeviceCodeResponse with device_code, user_code, and polling parameters
+
+    Raises:
+        AuthError: If the request fails
+    """
+    url = f"{api_url.rstrip('/')}/api/cli/device/code"
+
+    try:
+        with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
+            response = client.post(url)
+
+        if response.status_code != 200:
+            raise AuthError(
+                f"Device code request failed ({response.status_code}): {response.text}"
+            )
+
+        data = response.json()
+        return DeviceCodeResponse(
+            device_code=data["device_code"],
+            user_code=data["user_code"],
+            verification_uri=data["verification_uri"],
+            verification_uri_complete=data["verification_uri_complete"],
+            expires_in=data["expires_in"],
+            interval=data["interval"],
+        )
+
+    except KeyError as e:
+        raise AuthError(f"Device code response missing field: {e}") from e
+    except httpx.TimeoutException as e:
+        raise AuthError(f"Request timed out connecting to {api_url}") from e
+    except httpx.RequestError as e:
+        raise AuthError(f"Failed to connect to {api_url}: {e}") from e
+
+
+def poll_device_token(
+    device_code: str, api_url: str, interval: int, expires_in: int
+) -> str:
+    """Poll for the device token until the user authorizes or the code expires.
+
+    Args:
+        device_code: The device code from request_device_code()
+        api_url: Base URL of the API
+        interval: Initial polling interval in seconds
+        expires_in: Maximum time to poll in seconds
+
+    Returns:
+        The CLI JWT token
+
+    Raises:
+        AuthError: If the code expires, is denied, or a network error occurs
+    """
+    url = f"{api_url.rstrip('/')}/api/cli/device/token"
+    start = time.monotonic()
+    poll_interval = interval
+
+    while True:
+        time.sleep(poll_interval)
+
+        elapsed = time.monotonic() - start
+        if elapsed >= expires_in:
+            raise AuthError(
+                "Device code expired. Please run the login command again."
+            )
+
+        try:
+            with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
+                response = client.post(url, json={"device_code": device_code})
+
+            if response.status_code == 200:
+                data = response.json()
+                token = data.get("token")
+                if not token:
+                    raise AuthError("Device token response missing token.")
+                return token
+
+            # Handle pending/error states per RFC 8628
+            data = response.json()
+            error = data.get("error", "")
+
+            if error == "authorization_pending":
+                continue
+            elif error == "slow_down":
+                poll_interval += 5
+                continue
+            elif error == "expired_token":
+                raise AuthError(
+                    "Device code expired. Please run the login command again."
+                )
+            elif error == "access_denied":
+                raise AuthError("Authorization was denied by the user.")
+            else:
+                raise AuthError(
+                    f"Device token request failed ({response.status_code}): "
+                    f"{response.text}"
+                )
+
+        except httpx.TimeoutException as e:
+            raise AuthError(f"Request timed out connecting to {api_url}") from e
+        except httpx.RequestError as e:
+            raise AuthError(f"Failed to connect to {api_url}: {e}") from e
 
 
 def open_browser(url: str) -> bool:

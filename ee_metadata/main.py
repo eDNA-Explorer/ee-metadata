@@ -31,6 +31,8 @@ from ee_metadata.auth import (
     generate_state,
     load_token,
     open_browser,
+    poll_device_token,
+    request_device_code,
     save_token,
     start_callback_server,
     validate_token,
@@ -1184,19 +1186,28 @@ def login(
         "--no-browser",
         help="Skip automatic browser login; use manual token paste.",
     ),
+    device: bool = typer.Option(
+        False,
+        "--device",
+        help="Use device code flow (for headless/SSH environments).",
+    ),
 ):
     """Log in to eDNA Explorer.
 
     Opens a browser to authenticate, then automatically receives
-    the token. Falls back to manual token paste if needed.
+    the token. Falls back to device code flow, then manual token paste.
+
+    Use --device on headless servers (e.g. SSH into HPC clusters) to
+    authenticate by entering a code on any device with a browser.
     """
     state = generate_state()
     console.print("\n[bold cyan]eDNA Explorer Login[/bold cyan]\n")
 
     token = None
+    from_device = False
 
     # --- Attempt 1: Automatic browser flow ---
-    if not no_browser:
+    if not no_browser and not device:
         try:
             server, port = start_callback_server()
         except OSError:
@@ -1223,12 +1234,40 @@ def login(
                 except AuthError as e:
                     console.print(f"[bold red]Error:[/bold red] {e}")
 
-    # --- Attempt 2: Manual paste fallback ---
+    # --- Attempt 2: Device code flow ---
+    if token is None and not (no_browser and not device):
+        if not device and not no_browser:
+            console.print(
+                "[yellow]Browser login did not complete. "
+                "Trying device code flow...[/yellow]\n"
+            )
+
+        try:
+            device_resp = request_device_code(api_url)
+
+            console.print("[bold]Enter this code on any device with a browser:\n")
+            console.print(f"  [bold cyan]{device_resp.user_code}[/bold cyan]\n")
+            console.print(f"  URL: [link]{device_resp.verification_uri}[/link]\n")
+            console.print(
+                f"  Or open: [link]{device_resp.verification_uri_complete}[/link]\n"
+            )
+
+            with console.status("Waiting for authorization..."):
+                token = poll_device_token(
+                    device_code=device_resp.device_code,
+                    api_url=api_url,
+                    interval=device_resp.interval,
+                    expires_in=device_resp.expires_in,
+                )
+            from_device = True
+        except AuthError as e:
+            console.print(f"[bold red]Error:[/bold red] {e}\n")
+
+    # --- Attempt 3: Manual paste fallback ---
     if token is None:
         if not no_browser:
             console.print(
-                "[yellow]Browser login did not complete. "
-                "Falling back to manual token paste.[/yellow]\n"
+                "[yellow]Falling back to manual token paste.[/yellow]\n"
             )
 
         auth_url = f"{api_url}/cli/authorize?state={state}"
@@ -1241,18 +1280,19 @@ def login(
             raise typer.Exit(code=1)
         token = token.strip()
 
-    # --- Validate state embedded in JWT ---
-    try:
-        claims = decode_token_claims(token)
-        if claims.get("state") != state:
-            console.print(
-                "[bold red]Error:[/bold red] Token was not generated for this session. "
-                "Please try again."
-            )
-            raise typer.Exit(code=1)
-    except AuthError as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
-        raise typer.Exit(code=1) from None
+    # --- Validate state embedded in JWT (skip for device flow tokens) ---
+    if not from_device:
+        try:
+            claims = decode_token_claims(token)
+            if claims.get("state") != state:
+                console.print(
+                    "[bold red]Error:[/bold red] Token was not generated for this session. "
+                    "Please try again."
+                )
+                raise typer.Exit(code=1)
+        except AuthError as e:
+            console.print(f"[bold red]Error:[/bold red] {e}")
+            raise typer.Exit(code=1) from None
 
     # --- Validate token server-side and save ---
     console.print("[dim]Validating token...[/dim]")
