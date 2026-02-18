@@ -125,11 +125,6 @@ def _token_file() -> Path:
     return _config_dir() / "token.json"
 
 
-def _legacy_token_file() -> Path:
-    """Return path to the legacy token file (read-only, never written)."""
-    return Path.home() / ".ednaexplorer" / "token.json"
-
-
 def _parse_token_json(path: Path) -> TokenData | None:
     """Read and parse a token.json file, returning None on any failure."""
     try:
@@ -150,7 +145,7 @@ def _parse_token_json(path: Path) -> TokenData | None:
 
 
 def get_token() -> TokenData | None:
-    """Load a token using priority: env var > keyring > config file > legacy file.
+    """Load a token using priority: env var > keyring > config file.
 
     Returns None if no token is found anywhere.
     """
@@ -183,13 +178,6 @@ def get_token() -> TokenData | None:
     cfg = _token_file()
     if cfg.exists():
         result = _parse_token_json(cfg)
-        if result is not None:
-            return result
-
-    # 4. Legacy file (~/.ednaexplorer/token.json)
-    legacy = _legacy_token_file()
-    if legacy.exists():
-        result = _parse_token_json(legacy)
         if result is not None:
             return result
 
@@ -233,11 +221,11 @@ def store_token(
                 if keyring.get_password(SERVICE_NAME, ACCOUNT_REFRESH_TOKEN):
                     keyring.delete_password(SERVICE_NAME, ACCOUNT_REFRESH_TOKEN)
 
-        # Clean up any existing plaintext files
-        for path in (_token_file(), _legacy_token_file()):
-            if path.exists():
-                with contextlib.suppress(OSError):
-                    path.unlink()
+        # Clean up any existing plaintext file
+        cfg = _token_file()
+        if cfg.exists():
+            with contextlib.suppress(OSError):
+                cfg.unlink()
 
         return "keyring"
 
@@ -297,14 +285,14 @@ def clear_token() -> bool:
         except Exception:
             pass
 
-    # Config-dir file and legacy file
-    for path in (_token_file(), _legacy_token_file()):
-        if path.exists():
-            try:
-                path.unlink()
-                removed = True
-            except OSError:
-                pass
+    # Config-dir file
+    cfg = _token_file()
+    if cfg.exists():
+        try:
+            cfg.unlink()
+            removed = True
+        except OSError:
+            pass
 
     return removed
 
@@ -318,7 +306,6 @@ def storage_info() -> dict:
         "backend": None,
         "config_dir": str(_config_dir()),
         "token_file": str(_token_file()),
-        "legacy_token_file": str(_legacy_token_file()),
     }
 
     if _is_keyring_available():
@@ -342,10 +329,7 @@ def storage_info() -> dict:
                 info["storage_method"] = "keyring"
         except Exception:
             pass
-    if info["storage_method"] == "none":
-        if _token_file().exists():
-            info["storage_method"] = "file"
-        elif _legacy_token_file().exists():
-            info["storage_method"] = "legacy_file"
+    if info["storage_method"] == "none" and _token_file().exists():
+        info["storage_method"] = "file"
 
     return info

@@ -31,10 +31,6 @@ class TestGetToken:
             "ee_metadata.token_storage._token_file",
             lambda: tmp_path / "nonexistent" / "token.json",
         )
-        monkeypatch.setattr(
-            "ee_metadata.token_storage._legacy_token_file",
-            lambda: tmp_path / "nonexistent2" / "token.json",
-        )
         assert get_token() is None
 
     def test_env_var_takes_priority(self, monkeypatch):
@@ -89,28 +85,6 @@ class TestGetToken:
         assert result is not None
         assert result.token == "file-tok"
         assert result.api_url == "https://f.example.com"
-
-    def test_falls_back_to_legacy_file(self, tmp_path, monkeypatch):
-        legacy_file = tmp_path / "token.json"
-        legacy_file.write_text(
-            json.dumps({"token": "legacy-tok", "api_url": "https://l.example.com"})
-        )
-
-        monkeypatch.setattr(
-            "ee_metadata.token_storage._is_keyring_available", lambda: False
-        )
-        # Config file does not exist
-        monkeypatch.setattr(
-            "ee_metadata.token_storage._token_file",
-            lambda: tmp_path / "nonexistent" / "token.json",
-        )
-        monkeypatch.setattr(
-            "ee_metadata.token_storage._legacy_token_file", lambda: legacy_file
-        )
-
-        result = get_token()
-        assert result is not None
-        assert result.token == "legacy-tok"
 
     def test_returns_token_data_namedtuple(self):
         keyring.set_password(SERVICE_NAME, ACCOUNT_TOKEN, "tok")
@@ -188,10 +162,6 @@ class TestStoreToken:
 
         monkeypatch.setattr(
             "ee_metadata.token_storage._token_file", lambda: token_file
-        )
-        monkeypatch.setattr(
-            "ee_metadata.token_storage._legacy_token_file",
-            lambda: tmp_path / "nonexistent" / "token.json",
         )
 
         method = store_token("tok", "https://api.example.com")
@@ -272,10 +242,6 @@ class TestClearToken:
         monkeypatch.setattr(
             "ee_metadata.token_storage._token_file", lambda: token_file
         )
-        monkeypatch.setattr(
-            "ee_metadata.token_storage._legacy_token_file",
-            lambda: tmp_path / "nonexistent" / "token.json",
-        )
 
         assert clear_token() is True
         assert not token_file.exists()
@@ -284,10 +250,6 @@ class TestClearToken:
         monkeypatch.setattr(
             "ee_metadata.token_storage._token_file",
             lambda: tmp_path / "nonexistent" / "token.json",
-        )
-        monkeypatch.setattr(
-            "ee_metadata.token_storage._legacy_token_file",
-            lambda: tmp_path / "nonexistent2" / "token.json",
         )
 
         assert clear_token() is False
@@ -331,10 +293,6 @@ class TestStorageInfo:
         monkeypatch.setattr(
             "ee_metadata.token_storage._token_file",
             lambda: tmp_path / "nonexistent" / "token.json",
-        )
-        monkeypatch.setattr(
-            "ee_metadata.token_storage._legacy_token_file",
-            lambda: tmp_path / "nonexistent2" / "token.json",
         )
         monkeypatch.delenv("EDNA_TOKEN", raising=False)
 
