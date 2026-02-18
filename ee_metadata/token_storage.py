@@ -19,6 +19,7 @@ from typing import NamedTuple
 SERVICE_NAME = "edna-explorer-cli"
 ACCOUNT_TOKEN = "token"
 ACCOUNT_API_URL = "api_url"
+ACCOUNT_REFRESH_TOKEN = "refresh_token"
 
 
 class TokenData(NamedTuple):
@@ -26,6 +27,7 @@ class TokenData(NamedTuple):
 
     token: str
     api_url: str
+    refresh_token: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -42,12 +44,33 @@ def _is_headless() -> bool:
     )
 
 
+def _try_configure_cryptfile() -> bool:
+    """If keyrings.cryptfile is installed and KEYRING_CRYPTFILE_PASSWORD is set,
+    configure it as the active backend. Returns True if configured."""
+    passphrase = os.environ.get("KEYRING_CRYPTFILE_PASSWORD")
+    if not passphrase:
+        return False
+    try:
+        import keyring
+        from keyrings.cryptfile.cryptfile import CryptFileKeyring
+    except ImportError:
+        return False
+
+    kr = CryptFileKeyring()
+    kr.keyring_key = passphrase
+    keyring.set_keyring(kr)
+    return True
+
+
 def _is_keyring_available() -> bool:
     """Check whether a usable keyring backend is present.
 
     Returns False for null/fail backends or if keyring is not installed.
     All keyring imports are lazy to avoid a 2s+ startup penalty.
     """
+    # Try cryptfile first if env var is set
+    _try_configure_cryptfile()
+
     try:
         import keyring
         from keyring.backends.fail import Keyring as FailKeyring
@@ -115,7 +138,8 @@ def _parse_token_json(path: Path) -> TokenData | None:
         if not token:
             return None
         api_url = data.get("api_url", "https://www.ednaexplorer.org")
-        return TokenData(token=token, api_url=api_url)
+        refresh_token = data.get("refresh_token")
+        return TokenData(token=token, api_url=api_url, refresh_token=refresh_token)
     except (OSError, json.JSONDecodeError, KeyError):
         return None
 
@@ -144,9 +168,13 @@ def get_token() -> TokenData | None:
             token = keyring.get_password(SERVICE_NAME, ACCOUNT_TOKEN)
             if token:
                 api_url = keyring.get_password(SERVICE_NAME, ACCOUNT_API_URL)
+                refresh_token = keyring.get_password(
+                    SERVICE_NAME, ACCOUNT_REFRESH_TOKEN
+                )
                 return TokenData(
                     token=token,
                     api_url=api_url or "https://www.ednaexplorer.org",
+                    refresh_token=refresh_token,
                 )
         except Exception:
             pass
@@ -168,7 +196,13 @@ def get_token() -> TokenData | None:
     return None
 
 
-def store_token(token: str, api_url: str, *, insecure: bool = False) -> str:
+def store_token(
+    token: str,
+    api_url: str,
+    *,
+    insecure: bool = False,
+    refresh_token: str | None = None,
+) -> str:
     """Store a token securely.
 
     Tries keyring first. If unavailable and insecure=False, prints guidance
@@ -178,6 +212,7 @@ def store_token(token: str, api_url: str, *, insecure: bool = False) -> str:
         token: JWT token string
         api_url: Associated API URL
         insecure: Allow plaintext file storage when keyring is unavailable
+        refresh_token: Optional refresh token for transparent re-auth
 
     Returns:
         "keyring" or "file" indicating where the token was stored
@@ -190,6 +225,13 @@ def store_token(token: str, api_url: str, *, insecure: bool = False) -> str:
 
         keyring.set_password(SERVICE_NAME, ACCOUNT_TOKEN, token)
         keyring.set_password(SERVICE_NAME, ACCOUNT_API_URL, api_url)
+        if refresh_token:
+            keyring.set_password(SERVICE_NAME, ACCOUNT_REFRESH_TOKEN, refresh_token)
+        else:
+            # Clear any stale refresh token
+            with contextlib.suppress(Exception):
+                if keyring.get_password(SERVICE_NAME, ACCOUNT_REFRESH_TOKEN):
+                    keyring.delete_password(SERVICE_NAME, ACCOUNT_REFRESH_TOKEN)
 
         # Clean up any existing plaintext files
         for path in (_token_file(), _legacy_token_file()):
@@ -210,7 +252,9 @@ def store_token(token: str, api_url: str, *, insecure: bool = False) -> str:
             "     - Linux: sudo apt install gnome-keyring (or kwallet)\n"
             "     - macOS/Windows: keyring should work out of the box\n"
             "  2. Use --insecure-storage to store the token in a plaintext file\n"
-            "     (NOT recommended on shared machines)\n",
+            "     (NOT recommended on shared machines)\n"
+            "  3. Set KEYRING_CRYPTFILE_PASSWORD and install keyrings.cryptfile\n"
+            "     for encrypted file storage on headless systems\n",
             file=sys.stderr,
         )
         raise SystemExit(1)
@@ -218,7 +262,10 @@ def store_token(token: str, api_url: str, *, insecure: bool = False) -> str:
     # Insecure file-based storage
     cfg = _token_file()
     cfg.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    cfg.write_text(json.dumps({"token": token, "api_url": api_url}, indent=2))
+    data = {"token": token, "api_url": api_url}
+    if refresh_token:
+        data["refresh_token"] = refresh_token
+    cfg.write_text(json.dumps(data, indent=2))
 
     with contextlib.suppress(OSError):
         cfg.chmod(stat.S_IRUSR | stat.S_IWUSR)
@@ -243,7 +290,7 @@ def clear_token() -> bool:
         import keyring
 
         try:
-            for account in (ACCOUNT_TOKEN, ACCOUNT_API_URL):
+            for account in (ACCOUNT_TOKEN, ACCOUNT_API_URL, ACCOUNT_REFRESH_TOKEN):
                 if keyring.get_password(SERVICE_NAME, account) is not None:
                     keyring.delete_password(SERVICE_NAME, account)
                     removed = True
@@ -278,7 +325,10 @@ def storage_info() -> dict:
         import keyring
 
         backend = keyring.get_keyring()
-        info["backend"] = type(backend).__name__
+        backend_name = type(backend).__name__
+        info["backend"] = (
+            "cryptfile" if backend_name == "CryptFileKeyring" else backend_name
+        )
 
     # Determine current storage method
     env_token = os.environ.get("EDNA_TOKEN")
