@@ -15,14 +15,20 @@ from ee_metadata.auth import AuthError
 from ee_metadata.upload import (
     AllowedFile,
     ProjectUploadInfo,
+    ResumableSession,
     SignedUrlResponse,
     TokenExpiredUploadError,
     UploadError,
+    VerifyResult,
+    _query_upload_offset,
+    _resumable_upload_with_hash,
     _retry_transient,
     _streaming_upload_with_hash,
     get_allowed_filenames,
+    get_resumable_session,
     match_local_files,
     upload_file,
+    verify_upload,
 )
 
 # ---------------------------------------------------------------------------
@@ -261,11 +267,12 @@ class TestStreamingUpload:
         mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
         mock_client.put.side_effect = self._make_put_that_consumes_content()
 
-        sha, size = _streaming_upload_with_hash(
+        sha, md5, size = _streaming_upload_with_hash(
             filepath, "https://gcs.example.com/upload"
         )
 
         assert sha == expected_hash
+        assert md5 == hashlib.md5(content).hexdigest()
         assert size == len(content)
 
         filepath.unlink()
@@ -312,19 +319,27 @@ class TestStreamingUpload:
 
 
 class TestUploadFile:
+    @patch("ee_metadata.upload.verify_upload")
     @patch("ee_metadata.upload.complete_upload")
-    @patch("ee_metadata.upload._streaming_upload_with_hash")
-    @patch("ee_metadata.upload.get_signed_url")
-    def test_success_flow(self, mock_get_url, mock_stream, mock_complete):
+    @patch("ee_metadata.upload._resumable_upload_with_hash")
+    @patch("ee_metadata.upload.get_resumable_session")
+    @patch("ee_metadata.resume_store._config_dir")
+    def test_success_flow_resumable(
+        self, mock_config_dir, mock_get_session, mock_stream, mock_complete, mock_verify, tmp_path
+    ):
+        mock_config_dir.return_value = tmp_path / "config"
         filepath = _tmp_file(b"data")
         af = _make_allowed(filepath.name, "s1")
 
-        mock_get_url.return_value = SignedUrlResponse(
-            signed_url="https://gcs.example.com/upload",
+        mock_get_session.return_value = ResumableSession(
+            session_uri="https://storage.googleapis.com/upload/session/abc",
             sample_id="s1",
             file_id="f1",
         )
-        mock_stream.return_value = ("abc123hash", 4)
+        mock_stream.return_value = ("abc123hash", "def456md5", 4)
+        mock_verify.return_value = VerifyResult(
+            ok=True, remote_md5="3vu+", remote_size=4, local_md5="3vu+", local_size=4
+        )
 
         result = upload_file(
             filepath=filepath,
@@ -342,12 +357,55 @@ class TestUploadFile:
 
         filepath.unlink()
 
+    @patch("ee_metadata.upload.verify_upload")
+    @patch("ee_metadata.upload.complete_upload")
+    @patch("ee_metadata.upload._streaming_upload_with_hash")
+    @patch("ee_metadata.upload.get_resumable_session")
     @patch("ee_metadata.upload.get_signed_url")
-    def test_failure_returns_error_result(self, mock_get_url):
+    @patch("ee_metadata.resume_store._config_dir")
+    def test_fallback_to_signed_url(
+        self, mock_config_dir, mock_get_url, mock_get_session, mock_stream, mock_complete, mock_verify, tmp_path
+    ):
+        """Falls back to signed URL when resumable endpoint returns 404."""
+        mock_config_dir.return_value = tmp_path / "config"
         filepath = _tmp_file(b"data")
         af = _make_allowed(filepath.name, "s1")
 
-        mock_get_url.side_effect = UploadError("no permission")
+        mock_get_session.side_effect = UploadError(
+            "Resumable upload not available (404): Not found"
+        )
+        mock_get_url.return_value = SignedUrlResponse(
+            signed_url="https://gcs.example.com/upload",
+            sample_id="s1",
+            file_id="f1",
+        )
+        mock_stream.return_value = ("abc123hash", "def456md5", 4)
+        mock_verify.return_value = VerifyResult(
+            ok=True, remote_md5="3vu+", remote_size=4, local_md5="3vu+", local_size=4
+        )
+
+        result = upload_file(
+            filepath=filepath,
+            allowed_file=af,
+            project_id=PROJECT_ID,
+            project_metadata_id="pm-1",
+            token=TOKEN,
+            api_url=API_URL,
+        )
+
+        assert result.success
+        mock_get_url.assert_called_once()
+
+        filepath.unlink()
+
+    @patch("ee_metadata.upload.get_resumable_session")
+    @patch("ee_metadata.resume_store._config_dir")
+    def test_failure_returns_error_result(self, mock_config_dir, mock_get_session, tmp_path):
+        mock_config_dir.return_value = tmp_path / "config"
+        filepath = _tmp_file(b"data")
+        af = _make_allowed(filepath.name, "s1")
+
+        mock_get_session.side_effect = UploadError("no permission")
 
         result = upload_file(
             filepath=filepath,
@@ -434,15 +492,16 @@ class TestCircuitBreaker:
 
         filepath.unlink()
 
-    @patch("ee_metadata.upload._streaming_upload_with_hash")
-    @patch("ee_metadata.upload.get_signed_url")
-    def test_401_sets_cancel_event(self, mock_get_url, mock_stream):
-        """TokenExpiredUploadError from get_signed_url sets the cancel_event."""
+    @patch("ee_metadata.upload.get_resumable_session")
+    @patch("ee_metadata.resume_store._config_dir")
+    def test_401_sets_cancel_event(self, mock_config_dir, mock_get_session, tmp_path):
+        """TokenExpiredUploadError from get_resumable_session sets the cancel_event."""
+        mock_config_dir.return_value = tmp_path / "config"
         filepath = _tmp_file(b"data")
         af = _make_allowed(filepath.name, "s1")
         cancel = Event()
 
-        mock_get_url.side_effect = TokenExpiredUploadError("Token expired")
+        mock_get_session.side_effect = TokenExpiredUploadError("Token expired")
 
         result = upload_file(
             filepath=filepath,
@@ -457,30 +516,31 @@ class TestCircuitBreaker:
         assert not result.success
         assert not result.skipped  # First failure is not "skipped", it's the trigger
         assert cancel.is_set()
-        mock_stream.assert_not_called()
 
         filepath.unlink()
 
     @patch("ee_metadata.upload.complete_upload")
-    @patch("ee_metadata.upload._streaming_upload_with_hash")
-    @patch("ee_metadata.upload.get_signed_url")
+    @patch("ee_metadata.upload._resumable_upload_with_hash")
+    @patch("ee_metadata.upload.get_resumable_session")
+    @patch("ee_metadata.resume_store._config_dir")
     def test_cancel_after_gcs_put_skips_complete(
-        self, mock_get_url, mock_stream, mock_complete
+        self, mock_config_dir, mock_get_session, mock_stream, mock_complete, tmp_path
     ):
         """If cancel_event is set after GCS PUT, complete_upload is skipped."""
+        mock_config_dir.return_value = tmp_path / "config"
         filepath = _tmp_file(b"data")
         af = _make_allowed(filepath.name, "s1")
         cancel = Event()
 
-        mock_get_url.return_value = SignedUrlResponse(
-            signed_url="https://gcs.example.com/upload",
+        mock_get_session.return_value = ResumableSession(
+            session_uri="https://storage.googleapis.com/upload/session/abc",
             sample_id="s1",
             file_id="f1",
         )
 
         def _set_cancel_and_return(*args, **kwargs):
             cancel.set()
-            return ("abc123hash", 4)
+            return ("abc123hash", "def456md5", 4)
 
         mock_stream.side_effect = _set_cancel_and_return
 
@@ -497,6 +557,50 @@ class TestCircuitBreaker:
         assert not result.success
         assert result.skipped
         mock_complete.assert_not_called()
+
+        filepath.unlink()
+
+    @patch("ee_metadata.upload.complete_upload")
+    @patch("ee_metadata.upload._resumable_upload_with_hash")
+    @patch("ee_metadata.upload.get_resumable_session")
+    @patch("ee_metadata.resume_store._config_dir")
+    def test_cancel_after_gcs_put_preserves_resume_state(
+        self, mock_config_dir, mock_get_session, mock_stream, mock_complete, tmp_path
+    ):
+        """Resume state is NOT cleared when cancel_event fires after GCS upload."""
+        from ee_metadata.resume_store import _state_path
+
+        mock_config_dir.return_value = tmp_path / "config"
+        filepath = _tmp_file(b"data")
+        af = _make_allowed(filepath.name, "s1")
+        cancel = Event()
+
+        mock_get_session.return_value = ResumableSession(
+            session_uri="https://storage.googleapis.com/upload/session/abc",
+            sample_id="s1",
+            file_id="f1",
+        )
+
+        def _set_cancel_and_return(*args, **kwargs):
+            cancel.set()
+            return ("abc123hash", "def456md5", 4)
+
+        mock_stream.side_effect = _set_cancel_and_return
+
+        result = upload_file(
+            filepath=filepath,
+            allowed_file=af,
+            project_id=PROJECT_ID,
+            project_metadata_id="pm-1",
+            token=TOKEN,
+            api_url=API_URL,
+            cancel_event=cancel,
+        )
+
+        assert result.skipped
+        # Resume state should still exist so next run can skip re-upload
+        state_file = _state_path(PROJECT_ID, filepath.name)
+        assert state_file.exists(), "Resume state should be preserved after cancel"
 
         filepath.unlink()
 
@@ -662,3 +766,283 @@ class TestParseNoteType:
         result = get_allowed_filenames(PROJECT_ID, TOKEN, API_URL)
 
         assert result.allowed_files[0].note_type is None
+
+
+# ---------------------------------------------------------------------------
+# Resumable session request tests
+# ---------------------------------------------------------------------------
+
+
+class TestGetResumableSession:
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_success(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        mock_client.post.return_value = _mock_response(
+            200,
+            {
+                "sessionUri": "https://storage.googleapis.com/upload/session/abc",
+                "sampleId": "s1",
+                "fileId": "f1",
+            },
+        )
+
+        result = get_resumable_session(PROJECT_ID, "sample.fastq.gz", TOKEN, API_URL)
+
+        assert isinstance(result, ResumableSession)
+        assert result.session_uri == "https://storage.googleapis.com/upload/session/abc"
+        assert result.sample_id == "s1"
+        assert result.file_id == "f1"
+
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_401_raises_token_expired(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+        mock_client.post.return_value = _mock_response(401, text="Unauthorized")
+
+        with pytest.raises(TokenExpiredUploadError, match="Token expired"):
+            get_resumable_session(PROJECT_ID, "sample.fastq.gz", TOKEN, API_URL)
+
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_404_raises_upload_error(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+        mock_client.post.return_value = _mock_response(404, text="Not found")
+
+        with pytest.raises(UploadError, match="not available"):
+            get_resumable_session(PROJECT_ID, "sample.fastq.gz", TOKEN, API_URL)
+
+
+# ---------------------------------------------------------------------------
+# Query upload offset tests
+# ---------------------------------------------------------------------------
+
+
+class TestQueryUploadOffset:
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_308_returns_offset(self, mock_client_cls):
+        """308 with Range header returns confirmed byte offset."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        resp = MagicMock(spec=httpx.Response)
+        resp.status_code = 308
+        resp.headers = {"Range": "bytes=0-524287"}
+        mock_client.put.return_value = resp
+
+        offset = _query_upload_offset("https://session-uri", 1048576)
+
+        assert offset == 524288  # 524287 + 1
+
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_200_means_complete(self, mock_client_cls):
+        """200 response means upload is already complete."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        resp = MagicMock(spec=httpx.Response)
+        resp.status_code = 200
+        mock_client.put.return_value = resp
+
+        offset = _query_upload_offset("https://session-uri", 1048576)
+
+        assert offset == 1048576
+
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_404_returns_zero(self, mock_client_cls):
+        """404 response means session expired → return 0."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        resp = MagicMock(spec=httpx.Response)
+        resp.status_code = 404
+        mock_client.put.return_value = resp
+
+        offset = _query_upload_offset("https://session-uri", 1048576)
+
+        assert offset == 0
+
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_timeout_returns_zero(self, mock_client_cls):
+        """Timeout returns 0."""
+        mock_client_cls.return_value.__enter__ = MagicMock(
+            side_effect=httpx.TimeoutException("timeout")
+        )
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        offset = _query_upload_offset("https://session-uri", 1048576)
+
+        assert offset == 0
+
+
+# ---------------------------------------------------------------------------
+# Resumable upload with hash tests
+# ---------------------------------------------------------------------------
+
+
+class TestResumableUploadWithHash:
+    @patch("ee_metadata.resume_store._config_dir")
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_full_upload(self, mock_client_cls, mock_config_dir, tmp_path):
+        """Full upload from offset 0 computes correct hashes."""
+        mock_config_dir.return_value = tmp_path / "config"
+        content = b"hello world fastq data" * 100
+        filepath = _tmp_file(content)
+        expected_sha = hashlib.sha256(content).hexdigest()
+        expected_md5 = hashlib.md5(content).hexdigest()
+
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        # All chunks return 308 except we'll just have them all 308
+        # (the function checks for 200/201 on last chunk too)
+        resp_308 = MagicMock(spec=httpx.Response)
+        resp_308.status_code = 308
+        resp_200 = MagicMock(spec=httpx.Response)
+        resp_200.status_code = 200
+        mock_client.put.return_value = resp_200
+
+        sha, md5, size = _resumable_upload_with_hash(
+            filepath,
+            "https://session-uri",
+            PROJECT_ID,
+            len(content),
+            resume_offset=0,
+        )
+
+        assert sha == expected_sha
+        assert md5 == expected_md5
+        assert size == len(content)
+
+        filepath.unlink()
+
+    @patch("ee_metadata.resume_store._config_dir")
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_resumed_upload_correct_hashes(self, mock_client_cls, mock_config_dir, tmp_path):
+        """Resuming from offset still produces correct full-file hashes."""
+        mock_config_dir.return_value = tmp_path / "config"
+        content = b"A" * 1024 + b"B" * 1024  # 2KB file
+        filepath = _tmp_file(content)
+        expected_sha = hashlib.sha256(content).hexdigest()
+        expected_md5 = hashlib.md5(content).hexdigest()
+
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        resp_200 = MagicMock(spec=httpx.Response)
+        resp_200.status_code = 200
+        mock_client.put.return_value = resp_200
+
+        # Resume from offset 1024 (first 1KB already uploaded)
+        sha, md5, size = _resumable_upload_with_hash(
+            filepath,
+            "https://session-uri",
+            PROJECT_ID,
+            len(content),
+            resume_offset=1024,
+        )
+
+        # Hashes should be over ENTIRE file, not just the resumed portion
+        assert sha == expected_sha
+        assert md5 == expected_md5
+        assert size == len(content)
+
+        filepath.unlink()
+
+    @patch("ee_metadata.resume_store._config_dir")
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_calls_progress_callback(self, mock_client_cls, mock_config_dir, tmp_path):
+        """Progress callback receives resume offset + chunk bytes."""
+        mock_config_dir.return_value = tmp_path / "config"
+        content = b"x" * 1024
+        filepath = _tmp_file(content)
+
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        resp_200 = MagicMock(spec=httpx.Response)
+        resp_200.status_code = 200
+        mock_client.put.return_value = resp_200
+
+        callback = MagicMock()
+        _resumable_upload_with_hash(
+            filepath,
+            "https://session-uri",
+            PROJECT_ID,
+            len(content),
+            resume_offset=0,
+            progress_callback=callback,
+        )
+
+        assert callback.called
+        total_reported = sum(call.args[0] for call in callback.call_args_list)
+        assert total_reported == len(content)
+
+        filepath.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Verify upload tests
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyUpload:
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_success_match(self, mock_client_cls):
+        """Matching md5 and size returns ok=True."""
+        import base64
+
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        # GCS returns MD5 as base64
+        local_md5_hex = hashlib.md5(b"test data").hexdigest()
+        remote_md5_b64 = base64.b64encode(bytes.fromhex(local_md5_hex)).decode()
+
+        mock_client.post.return_value = _mock_response(
+            200,
+            {"md5Hash": remote_md5_b64, "size": 9},
+        )
+
+        result = verify_upload(PROJECT_ID, "sample.fastq.gz", local_md5_hex, 9, TOKEN, API_URL)
+
+        assert result.ok is True
+        assert result.remote_md5 == remote_md5_b64
+
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_mismatch(self, mock_client_cls):
+        """Different md5 returns ok=False."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        mock_client.post.return_value = _mock_response(
+            200,
+            {"md5Hash": "AAAA", "size": 9},
+        )
+
+        result = verify_upload(PROJECT_ID, "sample.fastq.gz", "abcdef1234567890", 9, TOKEN, API_URL)
+
+        assert result.ok is False
+
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_404_raises_upload_error(self, mock_client_cls):
+        """404 response raises UploadError."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+        mock_client.post.return_value = _mock_response(404, text="Not found")
+
+        with pytest.raises(UploadError, match="not found"):
+            verify_upload(PROJECT_ID, "sample.fastq.gz", "abc", 9, TOKEN, API_URL)
