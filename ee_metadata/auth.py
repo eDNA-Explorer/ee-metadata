@@ -16,6 +16,7 @@ import httpx
 
 DEFAULT_API_URL = "https://www.ednaexplorer.org"
 REQUEST_TIMEOUT = 30.0
+REFRESH_THRESHOLD_SECONDS = 300  # 5 minutes
 
 
 class AuthError(Exception):
@@ -130,6 +131,66 @@ def decode_token_claims(token: str) -> dict:
         raise AuthError(f"Invalid token payload: {e}") from e
 
 
+def is_token_expiring_soon(
+    token: str, threshold: int = REFRESH_THRESHOLD_SECONDS
+) -> bool:
+    """Check if JWT expires within threshold seconds.
+
+    Uses decode_token_claims (UX guard, not security).
+    """
+    try:
+        claims = decode_token_claims(token)
+        exp = claims.get("exp")
+        if exp is None:
+            return False
+        return time.time() >= (exp - threshold)
+    except AuthError:
+        return True
+
+
+def refresh_access_token(refresh_token: str, api_url: str) -> tuple[str, str]:
+    """Exchange a refresh token for a new access token and refresh token.
+
+    Args:
+        refresh_token: The refresh token from previous login/refresh
+        api_url: Base URL of the API
+
+    Returns:
+        Tuple of (new_access_token, new_refresh_token)
+
+    Raises:
+        TokenExpiredError: If the refresh token is invalid or expired (401)
+        AuthError: If the request fails for other reasons
+    """
+    url = f"{api_url.rstrip('/')}/api/cli/refresh"
+
+    try:
+        with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
+            response = client.post(url, json={"refresh_token": refresh_token})
+    except httpx.TimeoutException as e:
+        raise AuthError(f"Request timed out connecting to {api_url}") from e
+    except httpx.RequestError as e:
+        raise AuthError(f"Failed to connect to {api_url}: {e}") from e
+
+    if response.status_code == 401:
+        raise TokenExpiredError(
+            "Refresh token expired. Run 'ee-metadata login' again."
+        )
+
+    if response.status_code != 200:
+        raise AuthError(
+            f"Token refresh failed ({response.status_code}): {response.text}"
+        )
+
+    data = response.json()
+    new_token = data.get("token")
+    new_refresh = data.get("refresh_token")
+    if not new_token or not new_refresh:
+        raise AuthError("Token refresh returned incomplete response.")
+
+    return new_token, new_refresh
+
+
 # =============================================================================
 # Browser-based login (local callback server)
 # =============================================================================
@@ -230,7 +291,14 @@ def wait_for_callback(
         server.shutdown()
 
 
-def exchange_code(code: str, api_url: str) -> str:
+class ExchangeResult(NamedTuple):
+    """Result from code exchange."""
+
+    token: str
+    refresh_token: str | None
+
+
+def exchange_code(code: str, api_url: str) -> ExchangeResult:
     """Exchange a short-lived authorization code for a CLI token.
 
     Args:
@@ -238,7 +306,7 @@ def exchange_code(code: str, api_url: str) -> str:
         api_url: Base URL of the API
 
     Returns:
-        The CLI JWT token
+        ExchangeResult with access token and optional refresh token
 
     Raises:
         AuthError: If the exchange fails
@@ -258,13 +326,14 @@ def exchange_code(code: str, api_url: str) -> str:
         token = data.get("token")
         if not token:
             raise AuthError("Code exchange returned empty token.")
+        refresh_token = data.get("refresh_token")
 
     except httpx.TimeoutException as e:
         raise AuthError(f"Request timed out connecting to {api_url}") from e
     except httpx.RequestError as e:
         raise AuthError(f"Failed to connect to {api_url}: {e}") from e
 
-    return token
+    return ExchangeResult(token=token, refresh_token=refresh_token)
 
 
 # =============================================================================
@@ -315,7 +384,7 @@ def request_device_code(api_url: str) -> DeviceCodeResponse:
 
 def poll_device_token(
     device_code: str, api_url: str, interval: int, expires_in: int
-) -> str:
+) -> ExchangeResult:
     """Poll for the device token until the user authorizes or the code expires.
 
     Args:
@@ -325,7 +394,7 @@ def poll_device_token(
         expires_in: Maximum time to poll in seconds
 
     Returns:
-        The CLI JWT token
+        ExchangeResult with access token and optional refresh token
 
     Raises:
         AuthError: If the code expires, is denied, or a network error occurs
@@ -352,7 +421,8 @@ def poll_device_token(
                 token = data.get("token")
                 if not token:
                     raise AuthError("Device token response missing token.")
-                return token
+                refresh_token = data.get("refresh_token")
+                return ExchangeResult(token=token, refresh_token=refresh_token)
 
             # Handle pending/error states per RFC 8628
             data = response.json()
