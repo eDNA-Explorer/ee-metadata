@@ -27,6 +27,7 @@ dependencies = [
     "python-dateutil>=2.8.2,<3",
     "rapidfuzz>=3.6.0,<4",
     "httpx>=0.28,<0.29",
+    "keyring>=25.0",
 ]
 
 [project.optional-dependencies]
@@ -144,6 +145,9 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
     "PLR2004",  # Magic value used in comparison
     "S101",     # Use of assert
     "T201",     # print statements in tests
+]
+"ee_metadata/token_storage.py" = [
+    "PLC0415",  # Lazy keyring imports to avoid 2s+ startup penalty
 ]
 
 [tool.ruff.format]
