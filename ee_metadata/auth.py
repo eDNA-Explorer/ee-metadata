@@ -84,8 +84,16 @@ def save_token(token: str, api_url: str) -> None:
 
     # Set secure permissions (owner read/write only)
     # On Windows, this may not work the same way but won't raise
-    with contextlib.suppress(OSError):
+    try:
         TOKEN_FILE.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        import warnings
+
+        warnings.warn(
+            f"Could not set file permissions on {TOKEN_FILE}. "
+            "Token file may be readable by other users on this system.",
+            stacklevel=2,
+        )
 
 
 def load_token() -> TokenData:
