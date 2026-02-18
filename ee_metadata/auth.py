@@ -3,23 +3,18 @@
 from __future__ import annotations
 
 import base64
-import contextlib
 import json
 import secrets
-import stat
 import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import parse_qs, urlparse
 
 import httpx
 
 DEFAULT_API_URL = "https://www.ednaexplorer.org"
-TOKEN_DIR = Path.home() / ".ednaexplorer"
-TOKEN_FILE = TOKEN_DIR / "token.json"
 REQUEST_TIMEOUT = 30.0
 
 
@@ -27,19 +22,8 @@ class AuthError(Exception):
     """Base exception for authentication errors."""
 
 
-class TokenNotFoundError(AuthError):
-    """Raised when no token file exists."""
-
-
 class TokenExpiredError(AuthError):
     """Raised when token validation fails with 401."""
-
-
-class TokenData(NamedTuple):
-    """Token and API URL loaded from storage."""
-
-    token: str
-    api_url: str
 
 
 class UserInfo(NamedTuple):
@@ -59,70 +43,6 @@ class DeviceCodeResponse(NamedTuple):
     verification_uri_complete: str
     expires_in: int
     interval: int
-
-
-def get_token_path() -> Path:
-    """Return the path to the token file."""
-    return TOKEN_FILE
-
-
-def save_token(token: str, api_url: str) -> None:
-    """Save token to disk with secure permissions.
-
-    Creates ~/.ednaexplorer directory if it doesn't exist.
-    Sets file permissions to 0600 (owner read/write only).
-
-    Args:
-        token: The JWT token to save
-        api_url: The API URL associated with this token
-
-    Raises:
-        OSError: If unable to create directory or write file
-    """
-    TOKEN_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-    TOKEN_FILE.write_text(json.dumps({"token": token, "api_url": api_url}, indent=2))
-
-    # Set secure permissions (owner read/write only)
-    # On Windows, this may not work the same way but won't raise
-    try:
-        TOKEN_FILE.chmod(stat.S_IRUSR | stat.S_IWUSR)
-    except OSError:
-        import warnings
-
-        warnings.warn(
-            f"Could not set file permissions on {TOKEN_FILE}. "
-            "Token file may be readable by other users on this system.",
-            stacklevel=2,
-        )
-
-
-def load_token() -> TokenData:
-    """Load token from disk.
-
-    Returns:
-        TokenData containing token and api_url
-
-    Raises:
-        TokenNotFoundError: If token file doesn't exist
-        AuthError: If token file is invalid/corrupted
-    """
-    if not TOKEN_FILE.exists():
-        raise TokenNotFoundError(
-            "Not logged in. Run 'ee-metadata login' to authenticate."
-        )
-
-    try:
-        data = json.loads(TOKEN_FILE.read_text())
-        token = data.get("token")
-        api_url = data.get("api_url", DEFAULT_API_URL)
-
-        if not token:
-            raise AuthError("Token file is corrupted (missing token).")
-
-        return TokenData(token=token, api_url=api_url)
-
-    except json.JSONDecodeError as e:
-        raise AuthError(f"Token file is corrupted: {e}") from e
 
 
 def validate_token(token: str, api_url: str) -> UserInfo:
@@ -208,18 +128,6 @@ def decode_token_claims(token: str) -> dict:
         return json.loads(decoded)
     except (ValueError, json.JSONDecodeError) as e:
         raise AuthError(f"Invalid token payload: {e}") from e
-
-
-def clear_token() -> bool:
-    """Delete the token file.
-
-    Returns:
-        True if token was deleted, False if no token existed
-    """
-    if TOKEN_FILE.exists():
-        TOKEN_FILE.unlink()
-        return True
-    return False
 
 
 # =============================================================================
