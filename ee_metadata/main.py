@@ -1227,12 +1227,18 @@ def login(
 
             result = wait_for_callback(server)
             if result is not None:
-                # Exchange the short-lived code for a full token
-                console.print("[dim]Exchanging authorization code...[/dim]")
-                try:
-                    token = exchange_code(result.code, api_url)
-                except AuthError as e:
-                    console.print(f"[bold red]Error:[/bold red] {e}")
+                if result.state != state:
+                    console.print(
+                        "[bold red]Error:[/bold red] State mismatch in callback. "
+                        "This may indicate a CSRF attack. Please try again."
+                    )
+                else:
+                    # Exchange the short-lived code for a full token
+                    console.print("[dim]Exchanging authorization code...[/dim]")
+                    try:
+                        token = exchange_code(result.code, api_url)
+                    except AuthError as e:
+                        console.print(f"[bold red]Error:[/bold red] {e}")
 
     # --- Attempt 2: Device code flow ---
     if token is None and not (no_browser and not device):
