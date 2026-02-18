@@ -25,19 +25,21 @@ from ee_metadata.auth import (
     DEFAULT_API_URL,
     AuthError,
     TokenExpiredError,
-    TokenNotFoundError,
-    clear_token,
     decode_token_claims,
     exchange_code,
     generate_state,
-    load_token,
     open_browser,
     poll_device_token,
     request_device_code,
-    save_token,
     start_callback_server,
     validate_token,
     wait_for_callback,
+)
+from ee_metadata.token_storage import (
+    clear_token,
+    get_token,
+    storage_info,
+    store_token,
 )
 from ee_metadata.upload import (
     UploadError,
@@ -1192,6 +1194,11 @@ def login(
         "--device",
         help="Use device code flow (for headless/SSH environments).",
     ),
+    insecure_storage: bool = typer.Option(
+        False,
+        "--insecure-storage",
+        help="Store token in a plaintext file instead of the system keyring.",
+    ),
 ):
     """Log in to eDNA Explorer.
 
@@ -1312,10 +1319,16 @@ def login(
 
     try:
         user = validate_token(token, api_url)
-        save_token(token, api_url)
+        method = store_token(token, api_url, insecure=insecure_storage)
         display_name = user.name or user.email
         console.print(f"\n[bold green]✓ Logged in as {display_name}[/bold green]")
         console.print(f"[dim]Email: {user.email}[/dim]")
+        if method == "keyring":
+            console.print("[dim]Token stored securely in system keychain[/dim]")
+        else:
+            console.print(
+                "[dim yellow]Token stored in plaintext file (insecure)[/dim yellow]"
+            )
         console.print("[dim]Token expires in 2 hours[/dim]")
     except (AuthError, TokenExpiredError) as e:
         console.print(f"[bold red]Error:[/bold red] {e}")
@@ -1332,6 +1345,38 @@ def logout():
         console.print("[bold green]✓ Logged out[/bold green]")
     else:
         console.print("[yellow]Already logged out (no token found)[/yellow]")
+
+
+@app.command("auth-status")
+def auth_status():
+    """Show authentication and token storage diagnostics."""
+    info = storage_info()
+
+    table = Table(title="Auth Status", show_header=False)
+    table.add_column("Key", style="bold")
+    table.add_column("Value")
+
+    table.add_row("Keyring available", "yes" if info["keyring_available"] else "no")
+    table.add_row("Keyring backend", info["backend"] or "n/a")
+    table.add_row("Headless", "yes" if info["headless"] else "no")
+    table.add_row("Storage method", info["storage_method"])
+    table.add_row("Config dir", info["config_dir"])
+    table.add_row("Token file", info["token_file"])
+
+    token_data = get_token()
+    if token_data is not None:
+        table.add_row("Authenticated", "[green]yes[/green]")
+        table.add_row("API URL", token_data.api_url)
+        try:
+            user = validate_token(token_data.token, token_data.api_url)
+            display_name = user.name or user.email
+            table.add_row("User", display_name)
+        except (AuthError, TokenExpiredError) as e:
+            table.add_row("Token valid", f"[red]no ({e})[/red]")
+    else:
+        table.add_row("Authenticated", "[yellow]no[/yellow]")
+
+    console.print(table)
 
 
 @app.command()
@@ -1375,14 +1420,13 @@ def upload(
         raise typer.Exit(code=1)
 
     # Load and validate token
-    try:
-        token_data = load_token()
-    except TokenNotFoundError as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
-        raise typer.Exit(code=1) from None
-    except AuthError as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
-        raise typer.Exit(code=1) from None
+    token_data = get_token()
+    if token_data is None:
+        console.print(
+            "[bold red]Error:[/bold red] Not logged in. "
+            "Run 'ee-metadata login' to authenticate."
+        )
+        raise typer.Exit(code=1)
 
     # Validate token is still valid
     console.print("[dim]Checking authentication...[/dim]")
