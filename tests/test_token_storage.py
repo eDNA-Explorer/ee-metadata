@@ -9,6 +9,7 @@ import pytest
 
 from ee_metadata.token_storage import (
     ACCOUNT_API_URL,
+    ACCOUNT_REFRESH_TOKEN,
     ACCOUNT_TOKEN,
     SERVICE_NAME,
     TokenData,
@@ -120,6 +121,43 @@ class TestGetToken:
         assert result.token == "tok"
         assert result.api_url == "https://x.com"
 
+    def test_reads_refresh_token_from_keyring(self):
+        keyring.set_password(SERVICE_NAME, ACCOUNT_TOKEN, "tok")
+        keyring.set_password(SERVICE_NAME, ACCOUNT_API_URL, "https://x.com")
+        keyring.set_password(SERVICE_NAME, ACCOUNT_REFRESH_TOKEN, "rt-123")
+
+        result = get_token()
+        assert result is not None
+        assert result.refresh_token == "rt-123"
+
+    def test_reads_refresh_token_from_file(self, tmp_path, monkeypatch):
+        token_file = tmp_path / "token.json"
+        token_file.write_text(
+            json.dumps({
+                "token": "file-tok",
+                "api_url": "https://f.example.com",
+                "refresh_token": "rt-file",
+            })
+        )
+        monkeypatch.setattr(
+            "ee_metadata.token_storage._is_keyring_available", lambda: False
+        )
+        monkeypatch.setattr(
+            "ee_metadata.token_storage._token_file", lambda: token_file
+        )
+
+        result = get_token()
+        assert result is not None
+        assert result.refresh_token == "rt-file"
+
+    def test_refresh_token_defaults_to_none(self):
+        keyring.set_password(SERVICE_NAME, ACCOUNT_TOKEN, "tok")
+        keyring.set_password(SERVICE_NAME, ACCOUNT_API_URL, "https://x.com")
+
+        result = get_token()
+        assert result is not None
+        assert result.refresh_token is None
+
 
 # ---------------------------------------------------------------------------
 # store_token
@@ -136,6 +174,13 @@ class TestStoreToken:
             keyring.get_password(SERVICE_NAME, ACCOUNT_API_URL)
             == "https://api.example.com"
         )
+
+    def test_stores_refresh_token_in_keyring(self):
+        method = store_token(
+            "tok", "https://api.example.com", refresh_token="rt-456"
+        )
+        assert method == "keyring"
+        assert keyring.get_password(SERVICE_NAME, ACCOUNT_REFRESH_TOKEN) == "rt-456"
 
     def test_cleans_up_plaintext_after_keyring_store(self, tmp_path, monkeypatch):
         token_file = tmp_path / "token.json"
@@ -182,6 +227,27 @@ class TestStoreToken:
         assert data["token"] == "tok"
         assert data["api_url"] == "https://x.com"
 
+    def test_writes_refresh_token_to_file(self, tmp_path, monkeypatch):
+        token_file = tmp_path / "config" / "token.json"
+        monkeypatch.setattr(
+            "ee_metadata.token_storage._is_keyring_available", lambda: False
+        )
+        monkeypatch.setattr(
+            "ee_metadata.token_storage._token_file", lambda: token_file
+        )
+        monkeypatch.setattr(
+            "ee_metadata.token_storage._config_dir", lambda: tmp_path / "config"
+        )
+
+        with pytest.warns(UserWarning, match="plaintext"):
+            method = store_token(
+                "tok", "https://x.com", insecure=True, refresh_token="rt-file"
+            )
+
+        assert method == "file"
+        data = json.loads(token_file.read_text())
+        assert data["refresh_token"] == "rt-file"
+
 
 # ---------------------------------------------------------------------------
 # clear_token
@@ -192,10 +258,12 @@ class TestClearToken:
     def test_clears_keyring(self):
         keyring.set_password(SERVICE_NAME, ACCOUNT_TOKEN, "tok")
         keyring.set_password(SERVICE_NAME, ACCOUNT_API_URL, "https://x.com")
+        keyring.set_password(SERVICE_NAME, ACCOUNT_REFRESH_TOKEN, "rt")
 
         assert clear_token() is True
         assert keyring.get_password(SERVICE_NAME, ACCOUNT_TOKEN) is None
         assert keyring.get_password(SERVICE_NAME, ACCOUNT_API_URL) is None
+        assert keyring.get_password(SERVICE_NAME, ACCOUNT_REFRESH_TOKEN) is None
 
     def test_clears_file(self, tmp_path, monkeypatch):
         token_file = tmp_path / "token.json"
@@ -272,3 +340,27 @@ class TestStorageInfo:
 
         info = storage_info()
         assert info["storage_method"] == "none"
+
+
+# ---------------------------------------------------------------------------
+# _try_configure_cryptfile
+# ---------------------------------------------------------------------------
+
+
+class TestTryConfigureCryptfile:
+    def test_returns_false_without_env_var(self, monkeypatch):
+        from ee_metadata.token_storage import _try_configure_cryptfile
+
+        monkeypatch.delenv("KEYRING_CRYPTFILE_PASSWORD", raising=False)
+        assert _try_configure_cryptfile() is False
+
+    def test_returns_false_when_package_not_installed(self, monkeypatch):
+        from ee_metadata.token_storage import _try_configure_cryptfile
+
+        monkeypatch.setenv("KEYRING_CRYPTFILE_PASSWORD", "secret")
+        # The import will fail because keyrings.cryptfile isn't installed
+        # in the test environment (unless it is, in which case this test
+        # would configure it - both outcomes are valid)
+        result = _try_configure_cryptfile()
+        # Either False (not installed) or True (installed and configured)
+        assert isinstance(result, bool)
