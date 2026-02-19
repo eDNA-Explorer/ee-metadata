@@ -441,7 +441,7 @@ def _resumable_upload_with_hash(
     from ee_metadata.resume_store import ResumeState, save_resume_state
 
     sha256_hasher = hashlib.sha256()
-    md5_hasher = hashlib.md5()
+    md5_hasher = hashlib.md5(usedforsecurity=False)
 
     with filepath.open("rb") as fh:
         # Re-read already-uploaded bytes to restore hash state
@@ -551,7 +551,7 @@ def _streaming_upload_with_hash(
     """
     filesize = filepath.stat().st_size
     sha256_hasher = hashlib.sha256()
-    md5_hasher = hashlib.md5()
+    md5_hasher = hashlib.md5(usedforsecurity=False)
 
     def _chunk_generator():
         with filepath.open("rb") as fh:
@@ -813,7 +813,7 @@ def upload_file(
             if resume_offset >= filesize:
                 # Already complete on GCS — re-read file to compute hashes
                 sha256_hasher = hashlib.sha256()
-                md5_hasher = hashlib.md5()
+                md5_hasher = hashlib.md5(usedforsecurity=False)
                 with filepath.open("rb") as fh:
                     while True:
                         chunk = fh.read(UPLOAD_CHUNK_SIZE)
