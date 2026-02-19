@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import stat
 import sys
 import warnings
 from pathlib import Path
 from typing import NamedTuple
+
+log = logging.getLogger(__name__)
 
 SERVICE_NAME = "edna-explorer-cli"
 ACCOUNT_TOKEN = "token"
@@ -171,8 +174,8 @@ def get_token() -> TokenData | None:
                     api_url=api_url or "https://www.ednaexplorer.org",
                     refresh_token=refresh_token,
                 )
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("Keyring read failed, falling back to file: %s", e)
 
     # 3. Config-dir file
     cfg = _token_file()
@@ -282,8 +285,8 @@ def clear_token() -> bool:
                 if keyring.get_password(SERVICE_NAME, account) is not None:
                     keyring.delete_password(SERVICE_NAME, account)
                     removed = True
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("Keyring clear failed: %s", e)
 
     # Config-dir file
     cfg = _token_file()
