@@ -1191,7 +1191,10 @@ def ensure_valid_token(token_data: TokenData) -> TokenData:
         )
         store_token(new_access, token_data.api_url, refresh_token=new_refresh)
         console.print("[dim]Token refreshed automatically[/dim]")
-        return get_token()
+        result = get_token()
+        if result is None:
+            return token_data  # Store succeeded but read failed; use original
+        return result
     except (AuthError, TokenExpiredError):
         return token_data  # Let validate_token() catch the expiry
 
