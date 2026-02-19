@@ -31,7 +31,10 @@ jobs:
       run: uv python install ${{ matrix.python-version }}
 
     - name: Install dependencies
-      run: uv sync --python ${{ matrix.python-version }}
+      run: uv sync --python ${{ matrix.python-version }} --extra dev
+
+    - name: Run tests
+      run: uv run pytest tests/ -v
 
     - name: Test CLI import
       run: uv run python -c "from ee_metadata.main import app; print('✅ Import successful')"
