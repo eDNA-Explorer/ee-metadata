@@ -1,7 +1,8 @@
 import gzip
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import signal
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from threading import Event
 from typing import Any, Dict, List, Optional, Tuple
@@ -1571,6 +1572,27 @@ def upload(
     cancel_event = Event()
     interrupted = False
 
+    # ------------------------------------------------------------------
+    # SIGINT handler — the default KeyboardInterrupt mechanism is
+    # unreliable while the main thread is blocked inside C-level lock
+    # waits (as_completed / threading.Event.wait).  A custom handler
+    # gives us immediate, deterministic cancellation.
+    #   • 1st Ctrl+C → set cancel_event so worker threads stop after
+    #     their current chunk, then break out of the polling loop.
+    #   • 2nd Ctrl+C → os._exit(1) for an instant kill.
+    # ------------------------------------------------------------------
+    _original_sigint = signal.getsignal(signal.SIGINT)
+
+    def _sigint_handler(_signum, _frame):
+        nonlocal interrupted
+        cancel_event.set()
+        if interrupted:
+            # Second press — force-exit immediately.
+            os._exit(1)
+        interrupted = True
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+
     progress = Progress(
         SpinnerColumn(),
         TextColumn("[bold blue]{task.description}"),
@@ -1613,30 +1635,47 @@ def upload(
             )
             future_to_info[future] = (local_path.name, task_id)
 
-        for future in as_completed(future_to_info):
-            result = future.result()
-            results.append(result)
-            _name, tid = future_to_info[future]
-            if result.success:
-                progress.update(
-                    tid, description=f"[green]✓[/green] {_name}"
-                )
-            elif result.skipped:
-                progress.update(
-                    tid, description=f"[yellow]—[/yellow] {_name}"
-                )
-            else:
-                progress.update(
-                    tid, description=f"[red]✗[/red] {_name}"
-                )
+        # Poll for completed futures with a short timeout so the main
+        # thread wakes up frequently and can react to cancel_event
+        # (set by the SIGINT handler) without waiting for a future to
+        # finish.
+        pending = set(future_to_info)
+        while pending and not interrupted:
+            done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+            for future in done:
+                result = future.result()
+                results.append(result)
+                _name, tid = future_to_info[future]
+                if result.success:
+                    progress.update(
+                        tid, description=f"[green]✓[/green] {_name}"
+                    )
+                elif result.skipped:
+                    progress.update(
+                        tid, description=f"[yellow]—[/yellow] {_name}"
+                    )
+                else:
+                    progress.update(
+                        tid, description=f"[red]✗[/red] {_name}"
+                    )
     except KeyboardInterrupt:
         interrupted = True
         cancel_event.set()
     finally:
         progress.stop()
         executor.shutdown(wait=not interrupted, cancel_futures=interrupted)
+        signal.signal(signal.SIGINT, _original_sigint)
         if interrupted:
             console.print("\n[bold yellow]Upload cancelled by user.[/bold yellow]")
+            console.print(
+                "\nRe-run this command to upload remaining files. "
+                "Already-uploaded files will be skipped automatically.\n"
+            )
+            # Terminate immediately.  Worker threads may still be blocked
+            # on HTTP I/O and Python's atexit handler would call
+            # executor.shutdown(wait=True), hanging until they finish.
+            # Resume state is persisted per-chunk so nothing is lost.
+            os._exit(1)
 
     # Summary
     succeeded = sum(1 for r in results if r.success)
@@ -1658,20 +1697,14 @@ def upload(
             if not r.success and not r.skipped:
                 console.print(f"  {r.filename}: {r.error}")
 
-    if cancel_event.is_set() and not interrupted:
+    if cancel_event.is_set():
         console.print(
             "\n[bold yellow]Session expired during upload.[/bold yellow] "
             "Run [bold]ee-metadata login[/bold] then re-run this command. "
             "Already-uploaded files will be skipped automatically."
         )
 
-    if interrupted:
-        console.print(
-            "Re-run this command to upload remaining files. "
-            "Already-uploaded files will be skipped automatically."
-        )
-
-    if failed or cancel_event.is_set() or interrupted:
+    if failed or cancel_event.is_set():
         raise typer.Exit(code=1)
 
 

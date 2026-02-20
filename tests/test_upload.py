@@ -161,6 +161,7 @@ def _mock_response(status_code: int, json_data: dict | None = None, text: str = 
     resp = MagicMock(spec=httpx.Response)
     resp.status_code = status_code
     resp.text = text
+    resp.headers = {"content-type": "application/json"}
     if json_data is not None:
         resp.json.return_value = json_data
     return resp

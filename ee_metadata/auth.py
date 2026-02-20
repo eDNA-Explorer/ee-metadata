@@ -19,6 +19,23 @@ REQUEST_TIMEOUT = 30.0
 REFRESH_THRESHOLD_SECONDS = 300  # 5 minutes
 
 
+def _clean_response_body(response: httpx.Response, max_len: int = 200) -> str:
+    """Extract a clean error snippet from an HTTP response.
+
+    If the response looks like HTML (e.g. a Next.js 404 page), return a short
+    message instead of dumping the entire markup to the terminal.
+    """
+    text = response.text.strip()
+    content_type = response.headers.get("content-type", "")
+
+    if "text/html" in content_type or text[:15].lower().startswith(("<!doctype", "<html")):
+        return "(server returned an HTML error page)"
+
+    if len(text) > max_len:
+        return text[:max_len] + "…"
+    return text
+
+
 class AuthError(Exception):
     """Base exception for authentication errors."""
 
@@ -72,9 +89,16 @@ def validate_token(token: str, api_url: str) -> UserInfo:
                 "Token is invalid or expired. Run 'ee-metadata login' again."
             )
 
+        if response.status_code == 404:
+            raise AuthError(
+                "Authentication endpoint not found. "
+                "The API URL may be incorrect or the server may be outdated."
+            )
+
         if response.status_code != 200:
             raise AuthError(
-                f"API returned status {response.status_code}: {response.text}"
+                f"API returned status {response.status_code}: "
+                f"{_clean_response_body(response)}"
             )
 
         data = response.json()
@@ -179,7 +203,8 @@ def refresh_access_token(refresh_token: str, api_url: str) -> tuple[str, str]:
 
     if response.status_code != 200:
         raise AuthError(
-            f"Token refresh failed ({response.status_code}): {response.text}"
+            f"Token refresh failed ({response.status_code}): "
+            f"{_clean_response_body(response)}"
         )
 
     data = response.json()
@@ -319,7 +344,8 @@ def exchange_code(code: str, api_url: str) -> ExchangeResult:
 
         if response.status_code != 200:
             raise AuthError(
-                f"Code exchange failed ({response.status_code}): {response.text}"
+                f"Code exchange failed ({response.status_code}): "
+                f"{_clean_response_body(response)}"
             )
 
         data = response.json()
@@ -361,7 +387,8 @@ def request_device_code(api_url: str) -> DeviceCodeResponse:
 
         if response.status_code != 200:
             raise AuthError(
-                f"Device code request failed ({response.status_code}): {response.text}"
+                f"Device code request failed ({response.status_code}): "
+                f"{_clean_response_body(response)}"
             )
 
         data = response.json()
@@ -442,7 +469,7 @@ def poll_device_token(
             else:
                 raise AuthError(
                     f"Device token request failed ({response.status_code}): "
-                    f"{response.text}"
+                    f"{_clean_response_body(response)}"
                 )
 
         except httpx.TimeoutException as e:

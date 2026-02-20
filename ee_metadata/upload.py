@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from pathlib import Path
     from threading import Event
 
-from ee_metadata.auth import AuthError
+from ee_metadata.auth import AuthError, _clean_response_body
 
 log = logging.getLogger(__name__)
 
@@ -162,7 +162,8 @@ def get_allowed_filenames(
         raise UploadError(f"Project '{project_id}' not found.")
     if response.status_code != 200:
         raise UploadError(
-            f"Server returned status {response.status_code}: {response.text}"
+            f"Server returned status {response.status_code}: "
+            f"{_clean_response_body(response)}"
         )
 
     data = response.json()
@@ -215,7 +216,8 @@ def get_signed_url(
         raise UploadError("You don't have permission to upload to this project.")
     if response.status_code != 200:
         raise UploadError(
-            f"Failed to get upload URL ({response.status_code}): {response.text}"
+            f"Failed to get upload URL ({response.status_code}): "
+            f"{_clean_response_body(response)}"
         )
 
     data = response.json()
@@ -267,7 +269,8 @@ def complete_upload(
         )
     if response.status_code != 200:
         raise UploadError(
-            f"Upload completion failed ({response.status_code}): {response.text}"
+            f"Upload completion failed ({response.status_code}): "
+            f"{_clean_response_body(response)}"
         )
 
 
@@ -302,11 +305,13 @@ def get_resumable_session(
         raise UploadError("You don't have permission to upload to this project.")
     if response.status_code == 404:
         raise UploadError(
-            f"Resumable upload not available ({response.status_code}): {response.text}"
+            f"Resumable upload not available ({response.status_code}): "
+            f"{_clean_response_body(response)}"
         )
     if response.status_code != 200:
         raise UploadError(
-            f"Failed to get resumable session ({response.status_code}): {response.text}"
+            f"Failed to get resumable session ({response.status_code}): "
+            f"{_clean_response_body(response)}"
         )
 
     data = response.json()
@@ -353,7 +358,8 @@ def verify_upload(
         raise UploadError("Uploaded file not found in GCS for verification.")
     if response.status_code != 200:
         raise UploadError(
-            f"Verify request failed ({response.status_code}): {response.text}"
+            f"Verify request failed ({response.status_code}): "
+            f"{_clean_response_body(response)}"
         )
 
     data = response.json()
