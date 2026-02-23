@@ -1,4 +1,4 @@
-"""Tests for ensure_valid_token() in ee_metadata.main."""
+"""Tests for ensure_valid_token() in ee_metadata.commands.auth_cmd."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import warnings
 
 import pytest
 
-from ee_metadata.main import ensure_valid_token
+from ee_metadata.commands.auth_cmd import ensure_valid_token
 from ee_metadata.token_storage import TokenData, store_token
 
 
@@ -68,7 +68,7 @@ class TestEnsureValidTokenFileStorage:
         # Mock refresh to return new tokens
         new_token = _make_jwt(time.time() + 7200)
         monkeypatch.setattr(
-            "ee_metadata.main.refresh_access_token",
+            "ee_metadata.commands.auth_cmd.refresh_access_token",
             lambda rt, url: (new_token, "new-rt"),
         )
 
@@ -97,7 +97,7 @@ class TestEnsureValidTokenFileStorage:
 
         new_token = _make_jwt(time.time() + 7200)
         monkeypatch.setattr(
-            "ee_metadata.main.refresh_access_token",
+            "ee_metadata.commands.auth_cmd.refresh_access_token",
             lambda rt, url: (new_token, "new-rt"),
         )
 
@@ -115,7 +115,7 @@ class TestEnsureValidTokenFileStorage:
 
         # refresh_access_token should NOT be called
         monkeypatch.setattr(
-            "ee_metadata.main.refresh_access_token",
+            "ee_metadata.commands.auth_cmd.refresh_access_token",
             lambda rt, url: pytest.fail("Should not refresh"),
         )
 
