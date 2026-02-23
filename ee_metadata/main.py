@@ -1,3 +1,4 @@
+import concurrent.futures.thread as _cft
 import gzip
 import os
 import re
@@ -1675,16 +1676,20 @@ def upload(
         executor.shutdown(wait=not interrupted, cancel_futures=interrupted)
         signal.signal(signal.SIGINT, _original_sigint)
         if interrupted:
+            # Prevent the process from hanging at exit.  Python's atexit
+            # handler calls executor.shutdown(wait=True) on every pool
+            # tracked in concurrent.futures.thread._threads_queues.
+            # Workers may still be blocked on HTTP I/O, so we remove
+            # this pool's threads from the global registry.
+            for t in list(_cft._threads_queues):
+                _cft._threads_queues.pop(t, None)
+
             console.print("\n[bold yellow]Upload cancelled by user.[/bold yellow]")
             console.print(
                 "\nRe-run this command to upload remaining files. "
                 "Already-uploaded files will be skipped automatically.\n"
             )
-            # Terminate immediately.  Worker threads may still be blocked
-            # on HTTP I/O and Python's atexit handler would call
-            # executor.shutdown(wait=True), hanging until they finish.
-            # Resume state is persisted per-chunk so nothing is lost.
-            os._exit(1)
+            raise typer.Exit(code=130)
 
     # Summary
     succeeded = sum(1 for r in results if r.success)
