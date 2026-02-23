@@ -175,9 +175,7 @@ def login(
     # --- Attempt 3: Manual paste fallback ---
     if token is None:
         if not no_browser:
-            console.print(
-                "[yellow]Falling back to manual token paste.[/yellow]\n"
-            )
+            console.print("[yellow]Falling back to manual token paste.[/yellow]\n")
 
         auth_url = f"{api_url}/cli/authorize?state={state}"
         console.print("Open this URL to authenticate:\n")

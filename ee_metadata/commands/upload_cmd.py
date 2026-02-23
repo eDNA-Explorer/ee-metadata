@@ -267,17 +267,11 @@ def upload(
                 results.append(result)
                 _name, tid = future_to_info[future]
                 if result.success:
-                    progress.update(
-                        tid, description=f"[green]✓[/green] {_name}"
-                    )
+                    progress.update(tid, description=f"[green]✓[/green] {_name}")
                 elif result.skipped:
-                    progress.update(
-                        tid, description=f"[yellow]—[/yellow] {_name}"
-                    )
+                    progress.update(tid, description=f"[yellow]—[/yellow] {_name}")
                 else:
-                    progress.update(
-                        tid, description=f"[red]✗[/red] {_name}"
-                    )
+                    progress.update(tid, description=f"[red]✗[/red] {_name}")
     except KeyboardInterrupt:
         interrupted = True
         cancel_event.set()

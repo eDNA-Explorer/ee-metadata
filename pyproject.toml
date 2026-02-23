@@ -151,6 +151,9 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 "ee_metadata/token_storage.py" = [
     "PLC0415",  # Lazy keyring imports to avoid 2s+ startup penalty
 ]
+"ee_metadata/main.py" = [
+    "F401",  # Side-effect imports for command registration
+]
 
 [tool.ruff.format]
 # Use double quotes for strings

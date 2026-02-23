@@ -4,8 +4,7 @@ Centralizes the Typer app and Rich console so that command modules can
 register commands without circular imports.
 """
 
-import glob
-import os
+from pathlib import Path
 
 import typer
 from rich.console import Console
@@ -21,12 +20,12 @@ def complete_path(incomplete: str):
         incomplete = "./"
 
     # Expand user home directory
-    incomplete = os.path.expanduser(incomplete)
+    p = Path(incomplete).expanduser()
 
     # Get matching paths
-    if os.path.isdir(incomplete):
-        matches = glob.glob(os.path.join(incomplete, "*"))
+    if p.is_dir():
+        matches = [str(m) for m in p.glob("*")]
     else:
-        matches = glob.glob(incomplete + "*")
+        matches = [str(m) for m in p.parent.glob(f"{p.name}*")]
 
     return matches

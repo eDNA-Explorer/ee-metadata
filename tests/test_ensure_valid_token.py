@@ -16,9 +16,11 @@ from ee_metadata.token_storage import TokenData, store_token
 def _make_jwt(exp: float) -> str:
     """Create a minimal JWT with the given expiration timestamp."""
     header = base64.urlsafe_b64encode(b'{"alg":"HS256"}').decode().rstrip("=")
-    payload = base64.urlsafe_b64encode(
-        json.dumps({"exp": int(exp)}).encode()
-    ).decode().rstrip("=")
+    payload = (
+        base64.urlsafe_b64encode(json.dumps({"exp": int(exp)}).encode())
+        .decode()
+        .rstrip("=")
+    )
     return f"{header}.{payload}.fakesig"
 
 
@@ -32,9 +34,7 @@ def _disable_keyring(monkeypatch):
 def _use_tmp_token_file(monkeypatch, tmp_path):
     """Redirect token file storage to tmp_path."""
     token_file = tmp_path / "config" / "token.json"
-    monkeypatch.setattr(
-        "ee_metadata.token_storage._token_file", lambda: token_file
-    )
+    monkeypatch.setattr("ee_metadata.token_storage._token_file", lambda: token_file)
     monkeypatch.setattr(
         "ee_metadata.token_storage._config_dir", lambda: tmp_path / "config"
     )
@@ -55,8 +55,10 @@ class TestEnsureValidTokenFileStorage:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             store_token(
-                old_token, "https://api.test",
-                insecure=True, refresh_token="old-rt",
+                old_token,
+                "https://api.test",
+                insecure=True,
+                refresh_token="old-rt",
             )
 
         token_data = TokenData(

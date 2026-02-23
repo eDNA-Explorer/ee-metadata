@@ -9,11 +9,10 @@ from dateutil import parser as date_parser
 from rapidfuzz import fuzz
 from rich.table import Table
 
-from ee_metadata.cli import app, complete_path, console
-
 # Side-effect imports: register auth and upload commands with the Typer app
-import ee_metadata.commands.auth_cmd  # noqa: F401, E402
-import ee_metadata.commands.upload_cmd  # noqa: F401, E402
+import ee_metadata.commands.auth_cmd
+import ee_metadata.commands.upload_cmd
+from ee_metadata.cli import app, complete_path, console
 
 
 def clear_terminal():
@@ -138,7 +137,6 @@ def get_sample_id(filename: str) -> str:
     """Generates a Sample ID from a filename."""
     match = re.match(r"^(.*?)_S\d+", filename)
     return match.group(1) if match else get_base_name(filename).split("_")[0]
-
 
 
 # ============================================================================
@@ -1113,8 +1111,6 @@ def classify_sample_type_default(type_str: str) -> bool:
 def classify_sample_type(type_str: str) -> bool:
     """Classify sample type as Sample (True) or Control (False)."""
     return classify_sample_type_default(type_str)
-
-
 
 
 # =============================================================================
