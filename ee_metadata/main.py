@@ -1190,7 +1190,16 @@ def ensure_valid_token(token_data: TokenData) -> TokenData:
         new_access, new_refresh = refresh_access_token(
             token_data.refresh_token, token_data.api_url
         )
-        store_token(new_access, token_data.api_url, refresh_token=new_refresh)
+        # Preserve the storage backend: if the token was stored in a
+        # plaintext file (headless/no-keyring), pass insecure=True so
+        # store_token() writes back to file instead of raising SystemExit.
+        insecure = storage_info()["storage_method"] == "file"
+        store_token(
+            new_access,
+            token_data.api_url,
+            refresh_token=new_refresh,
+            insecure=insecure,
+        )
         console.print("[dim]Token refreshed automatically[/dim]")
         result = get_token()
         if result is None:
