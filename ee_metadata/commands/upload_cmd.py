@@ -108,7 +108,13 @@ def upload(
 
     # Show auth status
     display_name = user.name or user.email
-    console.print(f"[bold green]✓ Authenticated as {display_name}[/bold green]\n")
+    if user.role == "ADMIN":
+        console.print(
+            f"[bold green]✓ Authenticated as {display_name}[/bold green] "
+            "[bold cyan](Admin)[/bold cyan]\n"
+        )
+    else:
+        console.print(f"[bold green]✓ Authenticated as {display_name}[/bold green]\n")
 
     # Scan for FASTQ files
     files = sorted(directory.glob("*.fastq.gz"))

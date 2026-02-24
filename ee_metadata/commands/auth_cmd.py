@@ -212,6 +212,8 @@ def login(
         display_name = user.name or user.email
         console.print(f"\n[bold green]✓ Logged in as {display_name}[/bold green]")
         console.print(f"[dim]Email: {user.email}[/dim]")
+        if user.role == "ADMIN":
+            console.print("[bold cyan]Role: Admin[/bold cyan]")
         if method == "keyring":
             console.print("[dim]Token stored securely in system keychain[/dim]")
         else:
@@ -261,6 +263,10 @@ def auth_status():
             user = validate_token(token_data.token, token_data.api_url)
             display_name = user.name or user.email
             table.add_row("User", display_name)
+            if user.role == "ADMIN":
+                table.add_row("Role", "[bold cyan]Admin[/bold cyan]")
+            else:
+                table.add_row("Role", "User")
         except (AuthError, TokenExpiredError) as e:
             table.add_row("Token valid", f"[red]no ({e})[/red]")
     else:
