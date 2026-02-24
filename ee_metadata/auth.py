@@ -50,6 +50,7 @@ class UserInfo(NamedTuple):
     id: str
     email: str
     name: str
+    role: str
 
 
 class DeviceCodeResponse(NamedTuple):
@@ -106,6 +107,7 @@ def validate_token(token: str, api_url: str) -> UserInfo:
             id=data.get("id", ""),
             email=data.get("email", ""),
             name=data.get("name", ""),
+            role=data.get("role", "USER"),
         )
 
     except httpx.TimeoutException as e:
