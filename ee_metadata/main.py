@@ -1,5 +1,4 @@
 import gzip
-import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -8,16 +7,18 @@ import polars as pl
 import typer
 from dateutil import parser as date_parser
 from rapidfuzz import fuzz
-from rich.console import Console
 from rich.table import Table
 
-# Initialize Typer app and Rich console for nice terminal output
-app = typer.Typer()
-console = Console()
+# Side-effect imports: register auth and upload commands with the Typer app
+import ee_metadata.commands.auth_cmd
+import ee_metadata.commands.upload_cmd
+from ee_metadata.cli import app, complete_path, console
 
 
 def clear_terminal():
     """Clear the terminal screen for better UX."""
+    import os
+
     os.system("cls" if os.name == "nt" else "clear")
 
 
@@ -136,27 +137,6 @@ def get_sample_id(filename: str) -> str:
     """Generates a Sample ID from a filename."""
     match = re.match(r"^(.*?)_S\d+", filename)
     return match.group(1) if match else get_base_name(filename).split("_")[0]
-
-
-def complete_path(incomplete: str):
-    """Custom path completion function."""
-    import glob
-    import os
-
-    # Handle empty input
-    if not incomplete:
-        incomplete = "./"
-
-    # Expand user home directory
-    incomplete = os.path.expanduser(incomplete)
-
-    # Get matching paths
-    if os.path.isdir(incomplete):
-        matches = glob.glob(os.path.join(incomplete, "*"))
-    else:
-        matches = glob.glob(incomplete + "*")
-
-    return matches
 
 
 # ============================================================================
@@ -1086,10 +1066,9 @@ def classify_sample_type_with_rule(type_str: str, rule: Optional[str] = None) ->
         # Negative rule - if type_str does NOT contain the pattern, it's a sample
         pattern = rule[1:].lower()
         return pattern not in type_lower
-    else:
-        # Positive rule - if type_str contains the pattern, it's a sample
-        pattern = rule.lower()
-        return pattern in type_lower
+    # Positive rule - if type_str contains the pattern, it's a sample
+    pattern = rule.lower()
+    return pattern in type_lower
 
 
 def classify_sample_type_default(type_str: str) -> bool:
@@ -1132,6 +1111,11 @@ def classify_sample_type_default(type_str: str) -> bool:
 def classify_sample_type(type_str: str) -> bool:
     """Classify sample type as Sample (True) or Control (False)."""
     return classify_sample_type_default(type_str)
+
+
+# =============================================================================
+# Metadata Generation Command
+# =============================================================================
 
 
 @app.command()
@@ -1517,7 +1501,7 @@ def generate(
             sample_col = column_mapping["sample_name"]
             for i in range(metadata_df.height):
                 row_data = metadata_df.row(i, named=True)
-                sample_name = row_data.get(sample_col, f"Sample_{i+1}")
+                sample_name = row_data.get(sample_col, f"Sample_{i + 1}")
                 paired_samples.append(
                     {
                         "Sample ID": str(sample_name),
@@ -1699,25 +1683,23 @@ def generate(
 
                             if choice == "skip":
                                 break
-                            elif choice == "both":
+                            if choice == "both":
                                 disambiguated_high_priority.extend(markers)
                                 break
-                            else:
-                                try:
-                                    choice_num = int(choice)
-                                    if 1 <= choice_num <= len(markers):
-                                        disambiguated_high_priority.append(
-                                            markers[choice_num - 1]
-                                        )
-                                        break
-                                    else:
-                                        console.print(
-                                            f"[bold red]Error:[/bold red] Please enter a number between 1 and {len(markers)}"
-                                        )
-                                except ValueError:
-                                    console.print(
-                                        "[bold red]Error:[/bold red] Please enter a number, 'both', or 'skip'"
+                            try:
+                                choice_num = int(choice)
+                                if 1 <= choice_num <= len(markers):
+                                    disambiguated_high_priority.append(
+                                        markers[choice_num - 1]
                                     )
+                                    break
+                                console.print(
+                                    f"[bold red]Error:[/bold red] Please enter a number between 1 and {len(markers)}"
+                                )
+                            except ValueError:
+                                console.print(
+                                    "[bold red]Error:[/bold red] Please enter a number, 'both', or 'skip'"
+                                )
 
                 # Add non-conflicting markers directly
                 for marker_value, markers in marker_groups.items():
@@ -1783,7 +1765,7 @@ def generate(
                             marker_id for marker_id, _ in sorted_markers
                         ]
                         break
-                    elif selection == "high":
+                    if selection == "high":
                         confirmed_markers = [
                             marker_id for marker_id, _ in high_priority_markers
                         ]
@@ -1795,10 +1777,9 @@ def generate(
                         if all(1 <= i <= total_markers for i in indices):
                             confirmed_markers = [all_indices[i] for i in indices]
                             break
-                        else:
-                            console.print(
-                                f"[bold red]Error:[/bold red] Please enter numbers between 1 and {total_markers}"
-                            )
+                        console.print(
+                            f"[bold red]Error:[/bold red] Please enter numbers between 1 and {total_markers}"
+                        )
                     except ValueError:
                         console.print(
                             "[bold red]Error:[/bold red] Please enter numbers separated by commas, 'high', or 'all'"
@@ -1850,10 +1831,9 @@ def generate(
                 if all(1 <= i <= len(all_primers) for i in indices):
                     confirmed_markers = [all_primers[i - 1][0] for i in indices]
                     break
-                else:
-                    console.print(
-                        f"[bold red]Error:[/bold red] Please enter numbers between 1 and {len(all_primers)}"
-                    )
+                console.print(
+                    f"[bold red]Error:[/bold red] Please enter numbers between 1 and {len(all_primers)}"
+                )
             except ValueError:
                 console.print(
                     "[bold red]Error:[/bold red] Please enter numbers separated by commas or 'all'"
@@ -2002,7 +1982,7 @@ def generate(
 
     # Process FASTQ samples (matched and unmatched)
     for sample in paired_samples:
-        row = {col: "" for col in metadata_cols}
+        row = dict.fromkeys(metadata_cols, "")
 
         # Start with FASTQ-derived data
         row.update(
@@ -2071,7 +2051,7 @@ def generate(
         )
 
         for metadata_index in unmatched_metadata_indices:
-            row = {col: "" for col in metadata_cols}
+            row = dict.fromkeys(metadata_cols, "")
             metadata_row = metadata_df.row(metadata_index, named=True)
 
             # Fill in metadata fields
