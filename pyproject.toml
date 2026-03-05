@@ -1,6 +1,6 @@
 [project]
 name = "ee-metadata"
-version = "0.2.2"
+version = "0.2.3"
 description = "A high-performance CLI tool from eDNA-Explorer to generate metadata from a directory of fastq files."
 authors = [{name = "Jim Jeffers", email = "jim@ednaexplorer.org"}]
 license = {text = "MIT"}
