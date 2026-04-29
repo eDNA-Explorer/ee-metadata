@@ -1563,3 +1563,218 @@ class TestUploadFileDedup:
         mock_submit.assert_not_called()
 
         filepath.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Precomputed SHA-256 plumbing (greptile P2: avoid double SHA-256 pass)
+# ---------------------------------------------------------------------------
+
+
+class TestPrecomputedSha256:
+    @staticmethod
+    def _make_put_that_consumes_content(status_code=200):
+        def _put(url, *, content=None, headers=None):
+            if content is not None:
+                for _ in content:
+                    pass
+            return _mock_response(status_code)
+
+        return _put
+
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_streaming_upload_skips_sha256_when_precomputed(self, mock_client_cls):
+        """Helper trusts the supplied SHA-256 instead of recomputing.
+
+        Returning the precomputed value rather than the real file SHA
+        proves the inner hasher was never fed.
+        """
+        content = b"hello world fastq data" * 100
+        filepath = _tmp_file(content)
+        sentinel = "f" * 64  # distinct from the real SHA
+
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+        mock_client.put.side_effect = self._make_put_that_consumes_content()
+
+        sha, md5, size = _streaming_upload_with_hash(
+            filepath,
+            "https://gcs.example.com/upload",
+            precomputed_sha256=sentinel,
+        )
+
+        assert sha == sentinel
+        # MD5 must still be the real one — verify_upload depends on it.
+        assert md5 == hashlib.md5(content).hexdigest()
+        assert size == len(content)
+
+        filepath.unlink()
+
+    @patch("ee_metadata.resume_store._config_dir")
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_resumable_upload_skips_sha256_when_precomputed(
+        self, mock_client_cls, mock_config_dir, tmp_path
+    ):
+        """Resumable path with a partial-resume offset still trusts the
+        precomputed value — the resume-replay must not re-hash bytes."""
+        mock_config_dir.return_value = tmp_path / "config"
+        content = b"A" * 1024 + b"B" * 1024
+        filepath = _tmp_file(content)
+        sentinel = "0" * 64
+
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+        resp_200 = MagicMock(spec=httpx.Response)
+        resp_200.status_code = 200
+        mock_client.put.return_value = resp_200
+
+        sha, md5, size = _resumable_upload_with_hash(
+            filepath,
+            "https://session-uri",
+            PROJECT_ID,
+            len(content),
+            resume_offset=1024,
+            precomputed_sha256=sentinel,
+        )
+
+        assert sha == sentinel
+        # MD5 must still cover the entire file (replay + remaining bytes).
+        assert md5 == hashlib.md5(content).hexdigest()
+        assert size == len(content)
+
+        filepath.unlink()
+
+    @patch("ee_metadata.upload.verify_upload")
+    @patch("ee_metadata.upload.complete_upload")
+    @patch("ee_metadata.upload._streaming_upload_with_hash")
+    @patch("ee_metadata.upload.submit_checksum_challenge")
+    @patch("ee_metadata.upload.claim_by_checksum")
+    @patch("ee_metadata.upload.get_resumable_session")
+    @patch("ee_metadata.resume_store._config_dir")
+    def test_upload_file_threads_precomputed_sha_on_action_upload(
+        self,
+        mock_config_dir,
+        mock_get_session,
+        mock_claim,
+        mock_submit,
+        mock_stream,
+        mock_complete,
+        mock_verify,
+        tmp_path,
+    ):
+        """When the server returns action='upload', the pre-pass SHA-256
+        flows down into the upload helper so it skips the redundant pass."""
+        mock_config_dir.return_value = tmp_path / "config"
+        content = b"some fastq bytes" * 100
+        filepath = _tmp_file(content)
+        af = _make_allowed(filepath.name, "s1")
+        expected_sha = hashlib.sha256(content).hexdigest()
+
+        mock_claim.return_value = ClaimChecksum(
+            action="upload", reason="not_in_vault"
+        )
+        # Force the streaming fallback path (resumable session unavailable).
+        mock_get_session.side_effect = UploadError("resumable not available")
+        # Avoid actually patching get_signed_url — instead mock the helper
+        # the streaming branch ends up calling.
+        mock_stream.return_value = (expected_sha, "md5hex", len(content))
+        mock_verify.return_value = VerifyResult(
+            ok=True,
+            remote_md5="x",
+            remote_size=len(content),
+            local_md5="x",
+            local_size=len(content),
+        )
+
+        with patch("ee_metadata.upload.get_signed_url") as mock_get_url:
+            mock_get_url.return_value = SignedUrlResponse(
+                signed_url="https://gcs.example.com/upload",
+                sample_id="s1",
+                file_id="f1",
+            )
+            result = upload_file(
+                filepath=filepath,
+                allowed_file=af,
+                project_id=PROJECT_ID,
+                project_metadata_id="pm-1",
+                token=TOKEN,
+                api_url=API_URL,
+            )
+
+        assert result.success
+        assert result.deduped is False
+        mock_submit.assert_not_called()
+        # The helper was called with precomputed_sha256 set to the pre-pass value.
+        _, kwargs = mock_stream.call_args
+        assert kwargs.get("precomputed_sha256") == expected_sha
+
+        filepath.unlink()
+
+    @patch("ee_metadata.upload.verify_upload")
+    @patch("ee_metadata.upload.complete_upload")
+    @patch("ee_metadata.upload._resumable_upload_with_hash")
+    @patch("ee_metadata.upload.claim_by_checksum")
+    @patch("ee_metadata.upload._query_upload_offset")
+    @patch("ee_metadata.resume_store._config_dir")
+    def test_upload_file_no_precomputed_sha_when_resume_state_exists(
+        self,
+        mock_config_dir,
+        mock_query_offset,
+        mock_claim,
+        mock_resumable,
+        mock_complete,
+        mock_verify,
+        tmp_path,
+    ):
+        """When a resume state is loaded, the dedup pre-pass is skipped, so
+        the helper must be called with precomputed_sha256=None."""
+        import time
+
+        from ee_metadata.resume_store import ResumeState, save_resume_state
+
+        mock_config_dir.return_value = tmp_path / "config"
+        content = b"x" * 4096
+        filepath = _tmp_file(content)
+        af = _make_allowed(filepath.name, "s1")
+
+        save_resume_state(
+            ResumeState(
+                session_uri="https://storage.googleapis.com/upload/session/abc",
+                project_id=PROJECT_ID,
+                filename=filepath.name,
+                filesize=len(content),
+                file_mtime=filepath.stat().st_mtime,
+                bytes_uploaded=1024,
+                sample_id="s1",
+                file_id="f1",
+                created_at=time.time(),
+            )
+        )
+        mock_query_offset.return_value = 1024
+        mock_resumable.return_value = ("sha", "md5", len(content))
+        mock_verify.return_value = VerifyResult(
+            ok=True,
+            remote_md5="x",
+            remote_size=len(content),
+            local_md5="x",
+            local_size=len(content),
+        )
+
+        result = upload_file(
+            filepath=filepath,
+            allowed_file=af,
+            project_id=PROJECT_ID,
+            project_metadata_id="pm-1",
+            token=TOKEN,
+            api_url=API_URL,
+        )
+
+        assert result.success
+        # Dedup path was skipped entirely.
+        mock_claim.assert_not_called()
+        # Helper got precomputed_sha256=None — let it compute as today.
+        _, kwargs = mock_resumable.call_args
+        assert kwargs.get("precomputed_sha256") is None
+
+        filepath.unlink()

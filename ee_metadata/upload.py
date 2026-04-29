@@ -640,11 +640,16 @@ def _resumable_upload_with_hash(
     sample_id: str = "",
     file_id: str = "",
     cancel_event: Event | None = None,
+    precomputed_sha256: str | None = None,
 ) -> tuple[str, str, int]:
     """Upload a file in chunks using the GCS resumable upload protocol.
 
     Computes SHA-256 and MD5 over the entire file (re-reading from the start
     on resume to restore hash state).
+
+    When ``precomputed_sha256`` is supplied, the SHA-256 pass (including the
+    resume-replay) is skipped. MD5 is still computed because GCS verification
+    requires it.
 
     Returns:
         (sha256_hex, md5_hex, filesize) tuple.
@@ -654,7 +659,7 @@ def _resumable_upload_with_hash(
     """
     from ee_metadata.resume_store import ResumeState, save_resume_state
 
-    sha256_hasher = hashlib.sha256()
+    sha256_hasher = hashlib.sha256() if precomputed_sha256 is None else None
     md5_hasher = hashlib.md5(usedforsecurity=False)
 
     with filepath.open("rb") as fh:
@@ -665,7 +670,8 @@ def _resumable_upload_with_hash(
                 chunk = fh.read(min(UPLOAD_CHUNK_SIZE, remaining))
                 if not chunk:
                     break
-                sha256_hasher.update(chunk)
+                if sha256_hasher is not None:
+                    sha256_hasher.update(chunk)
                 md5_hasher.update(chunk)
                 remaining -= len(chunk)
 
@@ -684,7 +690,8 @@ def _resumable_upload_with_hash(
             if not chunk:
                 break
 
-            sha256_hasher.update(chunk)
+            if sha256_hasher is not None:
+                sha256_hasher.update(chunk)
             md5_hasher.update(chunk)
 
             # Content-Range: bytes {start}-{end-1}/{total}
@@ -737,7 +744,10 @@ def _resumable_upload_with_hash(
                     )
                 )
 
-    return sha256_hasher.hexdigest(), md5_hasher.hexdigest(), filesize
+    sha256_hex = (
+        precomputed_sha256 if precomputed_sha256 is not None else sha256_hasher.hexdigest()
+    )
+    return sha256_hex, md5_hasher.hexdigest(), filesize
 
 
 # ---------------------------------------------------------------------------
@@ -751,11 +761,16 @@ def _streaming_upload_with_hash(
     filepath: Path,
     signed_url: str,
     progress_callback: ProgressCallback | None = None,
+    precomputed_sha256: str | None = None,
 ) -> tuple[str, str, int]:
     """Upload a file to a pre-signed URL while computing SHA-256 and MD5.
 
     Reads the file once, feeding each chunk to both hashers and the
     upload stream. Peak memory usage is ~UPLOAD_CHUNK_SIZE per upload.
+
+    When ``precomputed_sha256`` is supplied, the SHA-256 pass is skipped
+    (the dedup pre-pass already hashed the whole file once). MD5 is still
+    computed because ``verify_upload`` compares it to GCS's stored value.
 
     Returns:
         (sha256_hex, md5_hex, filesize) tuple.
@@ -764,7 +779,7 @@ def _streaming_upload_with_hash(
         UploadError: If the PUT request fails.
     """
     filesize = filepath.stat().st_size
-    sha256_hasher = hashlib.sha256()
+    sha256_hasher = hashlib.sha256() if precomputed_sha256 is None else None
     md5_hasher = hashlib.md5(usedforsecurity=False)
 
     def _chunk_generator():
@@ -773,7 +788,8 @@ def _streaming_upload_with_hash(
                 chunk = fh.read(UPLOAD_CHUNK_SIZE)
                 if not chunk:
                     break
-                sha256_hasher.update(chunk)
+                if sha256_hasher is not None:
+                    sha256_hasher.update(chunk)
                 md5_hasher.update(chunk)
                 if progress_callback:
                     progress_callback(len(chunk))
@@ -799,7 +815,10 @@ def _streaming_upload_with_hash(
             f"GCS upload failed for {filepath.name} (status {response.status_code})"
         )
 
-    return sha256_hasher.hexdigest(), md5_hasher.hexdigest(), filesize
+    sha256_hex = (
+        precomputed_sha256 if precomputed_sha256 is not None else sha256_hasher.hexdigest()
+    )
+    return sha256_hex, md5_hasher.hexdigest(), filesize
 
 
 # ---------------------------------------------------------------------------
@@ -958,6 +977,10 @@ def upload_file(
         file_id: str = ""
         resume_offset = 0
         use_resumable = True
+        # Set by the dedup pre-pass below when we hash the whole file ahead
+        # of claim-by-checksum. Plumbed into the upload helpers so they can
+        # skip the redundant SHA-256 pass during transfer.
+        sha256_hex: str | None = None
 
         # 1. Check for existing resume state
         existing = load_resume_state(project_id, filename, filesize, file_mtime)
@@ -1092,19 +1115,26 @@ def upload_file(
         # 3. Upload the file
         if use_resumable and session_uri is not None:
             if resume_offset >= filesize:
-                # Already complete on GCS — re-read file to compute hashes
-                sha256_hasher = hashlib.sha256()
+                # Already complete on GCS — re-read file to compute hashes.
+                # SHA-256 is skipped if the dedup pre-pass already hashed it;
+                # MD5 still needs to be computed for verify_upload.
+                sha256_hasher = (
+                    hashlib.sha256() if sha256_hex is None else None
+                )
                 md5_hasher = hashlib.md5(usedforsecurity=False)
                 with filepath.open("rb") as fh:
                     while True:
                         chunk = fh.read(UPLOAD_CHUNK_SIZE)
                         if not chunk:
                             break
-                        sha256_hasher.update(chunk)
+                        if sha256_hasher is not None:
+                            sha256_hasher.update(chunk)
                         md5_hasher.update(chunk)
                         if progress_callback:
                             progress_callback(len(chunk))
-                checksum = sha256_hasher.hexdigest()
+                checksum = (
+                    sha256_hex if sha256_hex is not None else sha256_hasher.hexdigest()
+                )
                 md5_hex = md5_hasher.hexdigest()
             else:
                 checksum, md5_hex, filesize = _resumable_upload_with_hash(
@@ -1117,6 +1147,7 @@ def upload_file(
                     sample_id=sample_id,
                     file_id=file_id,
                     cancel_event=cancel_event,
+                    precomputed_sha256=sha256_hex,
                 )
         else:
             # Fallback: signed URL upload
@@ -1131,7 +1162,10 @@ def upload_file(
             sample_id = signed.sample_id
             file_id = signed.file_id
             checksum, md5_hex, filesize = _streaming_upload_with_hash(
-                filepath, signed.signed_url, progress_callback
+                filepath,
+                signed.signed_url,
+                progress_callback,
+                precomputed_sha256=sha256_hex,
             )
 
         # 4. Check cancel_event after upload — verification and completion need JWT
