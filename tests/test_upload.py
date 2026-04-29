@@ -1190,6 +1190,64 @@ class TestClaimByChecksum:
                 api_url=API_URL,
             )
 
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_non_json_body_raises_upload_error(self, mock_client_cls):
+        """200 with non-JSON body (e.g. CDN HTML page) must surface as
+        UploadError, not propagate ``json.JSONDecodeError`` out of the
+        helper and crash the worker pool via ``future.result()``.
+        """
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+        resp = _mock_response(200, text="<html>503</html>")
+        # Real httpx.Response.json() raises json.JSONDecodeError (a ValueError
+        # subclass) on bad bodies; emulate that here.
+        import json as _json
+
+        resp.json.side_effect = _json.JSONDecodeError("Expecting value", "x", 0)
+        mock_client.post.return_value = resp
+
+        with pytest.raises(UploadError, match="non-JSON"):
+            claim_by_checksum(
+                project_metadata_id="pm-1",
+                sample_id="s1",
+                file_name="x.fastq.gz",
+                checksum="c" * 64,
+                filesize=1024,
+                token=TOKEN,
+                api_url=API_URL,
+            )
+
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_malformed_ranges_raise_upload_error(self, mock_client_cls):
+        """Range entries missing 'offset'/'length' or with non-numeric
+        values must not propagate KeyError/ValueError out of the helper.
+        """
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+        mock_client.post.return_value = _mock_response(
+            200,
+            {
+                "action": "challenge",
+                "token": "jwt",
+                "nonce": _make_nonce_b64url(),
+                # 'length' missing → KeyError.
+                "ranges": [{"offset": 0}],
+            },
+        )
+
+        with pytest.raises(UploadError, match="malformed ranges"):
+            claim_by_checksum(
+                project_metadata_id="pm-1",
+                sample_id="s1",
+                file_name="x.fastq.gz",
+                checksum="c" * 64,
+                filesize=1024,
+                token=TOKEN,
+                api_url=API_URL,
+            )
+
 
 class TestSubmitChecksumChallenge:
     @patch("ee_metadata.upload.httpx.Client")
@@ -1237,6 +1295,26 @@ class TestSubmitChecksumChallenge:
         mock_client.post.return_value = _mock_response(401, text="Unauthorized")
 
         with pytest.raises(TokenExpiredUploadError):
+            submit_checksum_challenge(
+                challenge_token="jwt", mac="d" * 64, token=TOKEN, api_url=API_URL
+            )
+
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_non_json_body_raises_upload_error(self, mock_client_cls):
+        """200 with non-JSON body (e.g. CDN HTML page) must surface as
+        UploadError, not propagate ``json.JSONDecodeError`` out and crash
+        the worker pool via ``future.result()``.
+        """
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+        resp = _mock_response(200, text="<html>upstream timeout</html>")
+        import json as _json
+
+        resp.json.side_effect = _json.JSONDecodeError("Expecting value", "x", 0)
+        mock_client.post.return_value = resp
+
+        with pytest.raises(UploadError, match="non-JSON"):
             submit_checksum_challenge(
                 challenge_token="jwt", mac="d" * 64, token=TOKEN, api_url=API_URL
             )

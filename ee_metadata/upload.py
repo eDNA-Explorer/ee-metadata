@@ -363,14 +363,28 @@ def claim_by_checksum(
             f"{_clean_response_body(response)}"
         )
 
-    data = response.json()
+    try:
+        data = response.json()
+    except ValueError as e:
+        # Non-JSON 200 (e.g. CDN HTML error page). Convert to UploadError so
+        # the dedup fallback handler can catch it instead of crashing the
+        # worker pool via future.result(). Same pattern as _b64url_decode.
+        raise UploadError(
+            f"claim-by-checksum returned a non-JSON body: {e}"
+        ) from e
+
     action = data.get("action", "upload")
     ranges: list[ChallengeRange] | None = None
     if action == "challenge":
-        ranges = [
-            ChallengeRange(offset=int(r["offset"]), length=int(r["length"]))
-            for r in data.get("ranges", [])
-        ]
+        try:
+            ranges = [
+                ChallengeRange(offset=int(r["offset"]), length=int(r["length"]))
+                for r in data.get("ranges", [])
+            ]
+        except (KeyError, ValueError, TypeError) as e:
+            raise UploadError(
+                f"claim-by-checksum returned malformed ranges: {e}"
+            ) from e
     return ClaimChecksum(
         action=action,
         reason=data.get("reason"),
@@ -428,7 +442,12 @@ def submit_checksum_challenge(
             f"{_clean_response_body(response)}"
         )
 
-    data = response.json()
+    try:
+        data = response.json()
+    except ValueError as e:
+        raise UploadError(
+            f"submit-checksum-challenge returned a non-JSON body: {e}"
+        ) from e
     return ChallengeResult(
         status=data.get("status", "linked"),
         fastq_file_id=data.get("fastqFileId", ""),
