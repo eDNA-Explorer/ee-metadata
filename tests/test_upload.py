@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import base64 as _b64
 import hashlib
+import hmac as _hmac
+import os as _os
 import tempfile
 from pathlib import Path
 from threading import Event
@@ -14,19 +17,27 @@ import pytest
 from ee_metadata.auth import AuthError
 from ee_metadata.upload import (
     AllowedFile,
+    ChallengeRange,
+    ChallengeResult,
+    ClaimChecksum,
     ProjectUploadInfo,
     ResumableSession,
     SignedUrlResponse,
     TokenExpiredUploadError,
     UploadError,
     VerifyResult,
+    _b64url_decode,
+    _compute_challenge_mac,
+    _compute_file_sha256,
     _query_upload_offset,
     _resumable_upload_with_hash,
     _retry_transient,
     _streaming_upload_with_hash,
+    claim_by_checksum,
     get_allowed_filenames,
     get_resumable_session,
     match_local_files,
+    submit_checksum_challenge,
     upload_file,
     verify_upload,
 )
@@ -326,7 +337,13 @@ class TestUploadFile:
     @patch("ee_metadata.upload.get_resumable_session")
     @patch("ee_metadata.resume_store._config_dir")
     def test_success_flow_resumable(
-        self, mock_config_dir, mock_get_session, mock_stream, mock_complete, mock_verify, tmp_path
+        self,
+        mock_config_dir,
+        mock_get_session,
+        mock_stream,
+        mock_complete,
+        mock_verify,
+        tmp_path,
     ):
         mock_config_dir.return_value = tmp_path / "config"
         filepath = _tmp_file(b"data")
@@ -365,7 +382,14 @@ class TestUploadFile:
     @patch("ee_metadata.upload.get_signed_url")
     @patch("ee_metadata.resume_store._config_dir")
     def test_fallback_to_signed_url(
-        self, mock_config_dir, mock_get_url, mock_get_session, mock_stream, mock_complete, mock_verify, tmp_path
+        self,
+        mock_config_dir,
+        mock_get_url,
+        mock_get_session,
+        mock_stream,
+        mock_complete,
+        mock_verify,
+        tmp_path,
     ):
         """Falls back to signed URL when resumable endpoint returns 404."""
         mock_config_dir.return_value = tmp_path / "config"
@@ -401,7 +425,9 @@ class TestUploadFile:
 
     @patch("ee_metadata.upload.get_resumable_session")
     @patch("ee_metadata.resume_store._config_dir")
-    def test_failure_returns_error_result(self, mock_config_dir, mock_get_session, tmp_path):
+    def test_failure_returns_error_result(
+        self, mock_config_dir, mock_get_session, tmp_path
+    ):
         mock_config_dir.return_value = tmp_path / "config"
         filepath = _tmp_file(b"data")
         af = _make_allowed(filepath.name, "s1")
@@ -927,7 +953,9 @@ class TestResumableUploadWithHash:
 
     @patch("ee_metadata.resume_store._config_dir")
     @patch("ee_metadata.upload.httpx.Client")
-    def test_resumed_upload_correct_hashes(self, mock_client_cls, mock_config_dir, tmp_path):
+    def test_resumed_upload_correct_hashes(
+        self, mock_client_cls, mock_config_dir, tmp_path
+    ):
         """Resuming from offset still produces correct full-file hashes."""
         mock_config_dir.return_value = tmp_path / "config"
         content = b"A" * 1024 + b"B" * 1024  # 2KB file
@@ -1016,7 +1044,9 @@ class TestVerifyUpload:
             {"md5Hash": remote_md5_b64, "size": 9},
         )
 
-        result = verify_upload(PROJECT_ID, "sample.fastq.gz", local_md5_hex, 9, TOKEN, API_URL)
+        result = verify_upload(
+            PROJECT_ID, "sample.fastq.gz", local_md5_hex, 9, TOKEN, API_URL
+        )
 
         assert result.ok is True
         assert result.remote_md5 == remote_md5_b64
@@ -1033,7 +1063,9 @@ class TestVerifyUpload:
             {"md5Hash": "AAAA", "size": 9},
         )
 
-        result = verify_upload(PROJECT_ID, "sample.fastq.gz", "abcdef1234567890", 9, TOKEN, API_URL)
+        result = verify_upload(
+            PROJECT_ID, "sample.fastq.gz", "abcdef1234567890", 9, TOKEN, API_URL
+        )
 
         assert result.ok is False
 
@@ -1047,3 +1079,411 @@ class TestVerifyUpload:
 
         with pytest.raises(UploadError, match="not found"):
             verify_upload(PROJECT_ID, "sample.fastq.gz", "abc", 9, TOKEN, API_URL)
+
+
+# ---------------------------------------------------------------------------
+# FastQ-vault PoW dedup tests
+# ---------------------------------------------------------------------------
+
+
+def _make_nonce_b64url(raw: bytes = b"\x01" * 32) -> str:
+    """Return a nonce encoded the same way the server emits it (base64url no pad)."""
+    return _b64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+class TestClaimByChecksum:
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_returns_upload_action(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+        mock_client.post.return_value = _mock_response(
+            200, {"action": "upload", "reason": "not_in_vault"}
+        )
+
+        result = claim_by_checksum(
+            project_metadata_id="pm-1",
+            sample_id="s1",
+            file_name="sample.fastq.gz",
+            checksum="a" * 64,
+            filesize=1024,
+            token=TOKEN,
+            api_url=API_URL,
+        )
+
+        assert isinstance(result, ClaimChecksum)
+        assert result.action == "upload"
+        assert result.reason == "not_in_vault"
+        assert result.ranges is None
+
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_returns_challenge(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+        mock_client.post.return_value = _mock_response(
+            200,
+            {
+                "action": "challenge",
+                "token": "jwt.token.here",
+                "nonce": _make_nonce_b64url(),
+                "ranges": [
+                    {"offset": 0, "length": 8192},
+                    {"offset": 100000, "length": 131072},
+                ],
+                "expiresAt": "2026-04-29T12:00:00.000Z",
+            },
+        )
+
+        result = claim_by_checksum(
+            project_metadata_id="pm-1",
+            sample_id="s1",
+            file_name="sample.fastq.gz",
+            checksum="b" * 64,
+            filesize=1_000_000,
+            token=TOKEN,
+            api_url=API_URL,
+        )
+
+        assert result.action == "challenge"
+        assert result.token == "jwt.token.here"
+        assert result.ranges is not None
+        assert len(result.ranges) == 2
+        assert isinstance(result.ranges[0], ChallengeRange)
+        assert result.ranges[0].offset == 0
+        assert result.ranges[0].length == 8192
+        assert result.ranges[1].offset == 100000
+
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_401_raises_token_expired(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+        mock_client.post.return_value = _mock_response(401, text="Unauthorized")
+
+        with pytest.raises(TokenExpiredUploadError):
+            claim_by_checksum(
+                project_metadata_id="pm-1",
+                sample_id="s1",
+                file_name="x.fastq.gz",
+                checksum="c" * 64,
+                filesize=1024,
+                token=TOKEN,
+                api_url=API_URL,
+            )
+
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_500_raises_upload_error(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+        mock_client.post.return_value = _mock_response(500, text="boom")
+
+        with pytest.raises(UploadError, match="claim-by-checksum failed"):
+            claim_by_checksum(
+                project_metadata_id="pm-1",
+                sample_id="s1",
+                file_name="x.fastq.gz",
+                checksum="c" * 64,
+                filesize=1024,
+                token=TOKEN,
+                api_url=API_URL,
+            )
+
+
+class TestSubmitChecksumChallenge:
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_linked(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+        mock_client.post.return_value = _mock_response(
+            200,
+            {
+                "status": "linked",
+                "fastqFileId": "ff-1",
+                "verifyTriggered": True,
+            },
+        )
+
+        result = submit_checksum_challenge(
+            challenge_token="jwt", mac="d" * 64, token=TOKEN, api_url=API_URL
+        )
+
+        assert isinstance(result, ChallengeResult)
+        assert result.status == "linked"
+        assert result.fastq_file_id == "ff-1"
+        assert result.verify_triggered is True
+
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_403_raises_upload_error(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+        mock_client.post.return_value = _mock_response(
+            403, text="Challenge already used."
+        )
+
+        with pytest.raises(UploadError, match="denied"):
+            submit_checksum_challenge(
+                challenge_token="jwt", mac="d" * 64, token=TOKEN, api_url=API_URL
+            )
+
+    @patch("ee_metadata.upload.httpx.Client")
+    def test_401_raises_token_expired(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+        mock_client.post.return_value = _mock_response(401, text="Unauthorized")
+
+        with pytest.raises(TokenExpiredUploadError):
+            submit_checksum_challenge(
+                challenge_token="jwt", mac="d" * 64, token=TOKEN, api_url=API_URL
+            )
+
+
+class TestComputeChallengeMac:
+    def test_matches_independent_computation(self, tmp_path):
+        """Hex digest matches a stdlib HMAC over the concatenated ranges."""
+        # Random-ish 1 MB blob.
+        blob = _os.urandom(1_000_000)
+        filepath = tmp_path / "blob.bin"
+        filepath.write_bytes(blob)
+
+        nonce_raw = b"\x05" * 32
+        nonce_b64 = _make_nonce_b64url(nonce_raw)
+        ranges = [
+            ChallengeRange(offset=0, length=8192),
+            ChallengeRange(offset=500_000, length=8192),
+            ChallengeRange(offset=900_000, length=99_999),
+        ]
+
+        # Independent computation, server-style.
+        msg = b"".join(blob[r.offset : r.offset + r.length] for r in ranges)
+        expected = _hmac.new(nonce_raw, msg, hashlib.sha256).hexdigest()
+
+        actual = _compute_challenge_mac(filepath, nonce_b64, ranges)
+
+        assert actual == expected
+
+    def test_b64url_decode_roundtrip(self):
+        """Nonce decoder handles missing padding the way the server emits."""
+        for n in range(20, 40):
+            raw = b"\xab" * n
+            assert _b64url_decode(_make_nonce_b64url(raw)) == raw
+
+    def test_short_read_raises(self, tmp_path):
+        """If a range extends beyond EOF, an UploadError is raised."""
+        filepath = tmp_path / "tiny.bin"
+        filepath.write_bytes(b"x" * 100)
+
+        with pytest.raises(UploadError, match="short read"):
+            _compute_challenge_mac(
+                filepath,
+                _make_nonce_b64url(),
+                [ChallengeRange(offset=50, length=200)],
+            )
+
+
+class TestComputeFileSha256:
+    def test_matches_hashlib(self, tmp_path):
+        content = b"hello world\n" * 1000
+        filepath = tmp_path / "f.bin"
+        filepath.write_bytes(content)
+
+        assert _compute_file_sha256(filepath) == hashlib.sha256(content).hexdigest()
+
+
+class TestUploadFileDedup:
+    @patch("ee_metadata.upload.complete_upload")
+    @patch("ee_metadata.upload.submit_checksum_challenge")
+    @patch("ee_metadata.upload.claim_by_checksum")
+    @patch("ee_metadata.upload.get_resumable_session")
+    @patch("ee_metadata.upload.get_signed_url")
+    @patch("ee_metadata.resume_store._config_dir")
+    def test_skips_upload_on_dedup(
+        self,
+        mock_config_dir,
+        mock_get_url,
+        mock_get_session,
+        mock_claim,
+        mock_submit,
+        mock_complete,
+        tmp_path,
+    ):
+        """When server returns a challenge and we answer it, no upload happens."""
+        mock_config_dir.return_value = tmp_path / "config"
+        content = b"some fastq bytes" * 100
+        filepath = _tmp_file(content)
+        af = _make_allowed(filepath.name, "s1")
+
+        mock_claim.return_value = ClaimChecksum(
+            action="challenge",
+            token="jwt",
+            nonce=_make_nonce_b64url(),
+            ranges=[ChallengeRange(offset=0, length=16)],
+            expires_at="2026-04-29T12:00:00Z",
+        )
+        mock_submit.return_value = ChallengeResult(
+            status="linked", fastq_file_id="ff-1", verify_triggered=True
+        )
+
+        progress = MagicMock()
+        result = upload_file(
+            filepath=filepath,
+            allowed_file=af,
+            project_id=PROJECT_ID,
+            project_metadata_id="pm-1",
+            token=TOKEN,
+            api_url=API_URL,
+            progress_callback=progress,
+        )
+
+        assert result.success
+        assert result.deduped is True
+        assert result.checksum == hashlib.sha256(content).hexdigest()
+        assert result.filesize == len(content)
+        # Normal upload path must NOT have run.
+        mock_get_session.assert_not_called()
+        mock_get_url.assert_not_called()
+        mock_complete.assert_not_called()
+        # Progress bar advanced by the full filesize.
+        progress.assert_called_with(len(content))
+
+        filepath.unlink()
+
+    @patch("ee_metadata.upload.verify_upload")
+    @patch("ee_metadata.upload.complete_upload")
+    @patch("ee_metadata.upload._resumable_upload_with_hash")
+    @patch("ee_metadata.upload.submit_checksum_challenge")
+    @patch("ee_metadata.upload.claim_by_checksum")
+    @patch("ee_metadata.upload.get_resumable_session")
+    @patch("ee_metadata.resume_store._config_dir")
+    def test_falls_back_when_challenge_denied(
+        self,
+        mock_config_dir,
+        mock_get_session,
+        mock_claim,
+        mock_submit,
+        mock_stream,
+        mock_complete,
+        mock_verify,
+        tmp_path,
+    ):
+        """403 from submit-challenge → fall back to normal upload."""
+        mock_config_dir.return_value = tmp_path / "config"
+        filepath = _tmp_file(b"data")
+        af = _make_allowed(filepath.name, "s1")
+
+        mock_claim.return_value = ClaimChecksum(
+            action="challenge",
+            token="jwt",
+            nonce=_make_nonce_b64url(),
+            ranges=[ChallengeRange(offset=0, length=4)],
+        )
+        mock_submit.side_effect = UploadError(
+            "Vault dedup challenge denied; will retry as a normal upload."
+        )
+        mock_get_session.return_value = ResumableSession(
+            session_uri="https://storage.googleapis.com/upload/session/abc",
+            sample_id="s1",
+            file_id="f1",
+        )
+        mock_stream.return_value = ("abc123hash", "def456md5", 4)
+        mock_verify.return_value = VerifyResult(
+            ok=True, remote_md5="3vu+", remote_size=4, local_md5="3vu+", local_size=4
+        )
+
+        result = upload_file(
+            filepath=filepath,
+            allowed_file=af,
+            project_id=PROJECT_ID,
+            project_metadata_id="pm-1",
+            token=TOKEN,
+            api_url=API_URL,
+        )
+
+        assert result.success
+        assert result.deduped is False
+        mock_get_session.assert_called_once()
+        mock_complete.assert_called_once()
+
+        filepath.unlink()
+
+    @patch("ee_metadata.upload.verify_upload")
+    @patch("ee_metadata.upload.complete_upload")
+    @patch("ee_metadata.upload._resumable_upload_with_hash")
+    @patch("ee_metadata.upload.submit_checksum_challenge")
+    @patch("ee_metadata.upload.claim_by_checksum")
+    @patch("ee_metadata.upload.get_resumable_session")
+    @patch("ee_metadata.resume_store._config_dir")
+    def test_action_upload_uses_normal_path(
+        self,
+        mock_config_dir,
+        mock_get_session,
+        mock_claim,
+        mock_submit,
+        mock_stream,
+        mock_complete,
+        mock_verify,
+        tmp_path,
+    ):
+        """When server says 'upload' (not in vault), normal flow runs and submit is never called."""
+        mock_config_dir.return_value = tmp_path / "config"
+        filepath = _tmp_file(b"data")
+        af = _make_allowed(filepath.name, "s1")
+
+        mock_claim.return_value = ClaimChecksum(action="upload", reason="not_in_vault")
+        mock_get_session.return_value = ResumableSession(
+            session_uri="https://storage.googleapis.com/upload/session/abc",
+            sample_id="s1",
+            file_id="f1",
+        )
+        mock_stream.return_value = ("abc123hash", "def456md5", 4)
+        mock_verify.return_value = VerifyResult(
+            ok=True, remote_md5="3vu+", remote_size=4, local_md5="3vu+", local_size=4
+        )
+
+        result = upload_file(
+            filepath=filepath,
+            allowed_file=af,
+            project_id=PROJECT_ID,
+            project_metadata_id="pm-1",
+            token=TOKEN,
+            api_url=API_URL,
+        )
+
+        assert result.success
+        assert result.deduped is False
+        mock_submit.assert_not_called()
+        mock_get_session.assert_called_once()
+
+        filepath.unlink()
+
+    @patch("ee_metadata.upload.submit_checksum_challenge")
+    @patch("ee_metadata.upload.claim_by_checksum")
+    def test_token_expired_during_claim_trips_circuit_breaker(
+        self, mock_claim, mock_submit, tmp_path
+    ):
+        """401 from claim_by_checksum sets cancel_event and returns failure."""
+        filepath = _tmp_file(b"data")
+        af = _make_allowed(filepath.name, "s1")
+        cancel = Event()
+
+        mock_claim.side_effect = TokenExpiredUploadError("Token expired")
+
+        result = upload_file(
+            filepath=filepath,
+            allowed_file=af,
+            project_id=PROJECT_ID,
+            project_metadata_id="pm-1",
+            token=TOKEN,
+            api_url=API_URL,
+            cancel_event=cancel,
+        )
+
+        assert not result.success
+        assert cancel.is_set()
+        mock_submit.assert_not_called()
+
+        filepath.unlink()

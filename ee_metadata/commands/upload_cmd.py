@@ -272,7 +272,12 @@ def upload(
                 result = future.result()
                 results.append(result)
                 _name, tid = future_to_info[future]
-                if result.success:
+                if result.success and result.deduped:
+                    progress.update(
+                        tid,
+                        description=f"[green]✓[/green] {_name} [dim](linked from vault)[/dim]",
+                    )
+                elif result.success:
                     progress.update(tid, description=f"[green]✓[/green] {_name}")
                 elif result.skipped:
                     progress.update(tid, description=f"[yellow]—[/yellow] {_name}")
@@ -303,14 +308,27 @@ def upload(
 
     # Summary
     succeeded = sum(1 for r in results if r.success)
+    deduped = sum(1 for r in results if r.success and r.deduped)
     failed = sum(1 for r in results if not r.success and not r.skipped)
     skipped = sum(1 for r in results if r.skipped)
 
     console.print()
     if succeeded:
-        console.print(
-            f"[bold green]✓ {succeeded} file(s) uploaded successfully[/bold green]"
-        )
+        uploaded_count = succeeded - deduped
+        if deduped and uploaded_count:
+            console.print(
+                f"[bold green]✓ {uploaded_count} file(s) uploaded, "
+                f"{deduped} linked from vault[/bold green]"
+            )
+        elif deduped:
+            console.print(
+                f"[bold green]✓ {deduped} file(s) linked from vault "
+                "(no upload needed)[/bold green]"
+            )
+        else:
+            console.print(
+                f"[bold green]✓ {succeeded} file(s) uploaded successfully[/bold green]"
+            )
     if skipped:
         console.print(
             f"[bold yellow]— {skipped} file(s) skipped (token expired)[/bold yellow]"

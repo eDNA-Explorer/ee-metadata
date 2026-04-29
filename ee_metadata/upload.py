@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import logging
 import time
 from collections.abc import Callable
@@ -95,6 +96,36 @@ class UploadResult:
     checksum: str | None = None
     filesize: int = 0
     skipped: bool = False
+    deduped: bool = False
+
+
+@dataclass
+class ChallengeRange:
+    """A single byte range the server asked the client to hash."""
+
+    offset: int
+    length: int
+
+
+@dataclass
+class ClaimChecksum:
+    """Response from the claim-by-checksum endpoint."""
+
+    action: str  # 'upload' | 'challenge'
+    reason: str | None = None
+    token: str | None = None
+    nonce: str | None = None
+    ranges: list[ChallengeRange] | None = None
+    expires_at: str | None = None
+
+
+@dataclass
+class ChallengeResult:
+    """Response from the submit-checksum-challenge endpoint."""
+
+    status: str  # 'linked'
+    fastq_file_id: str
+    verify_triggered: bool
 
 
 @dataclass
@@ -133,6 +164,52 @@ class VerifyResult:
 
 def _bearer_headers(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
+
+
+def _compute_file_sha256(filepath: Path) -> str:
+    """Stream the whole file once and return the hex SHA-256."""
+    h = hashlib.sha256()
+    with filepath.open("rb") as fh:
+        while True:
+            chunk = fh.read(HASH_CHUNK_SIZE)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _b64url_decode(s: str) -> bytes:
+    pad = "=" * ((4 - len(s) % 4) % 4)
+    return base64.urlsafe_b64decode(s + pad)
+
+
+def _compute_challenge_mac(
+    filepath: Path,
+    nonce_b64url: str,
+    ranges: list[ChallengeRange],
+) -> str:
+    """Compute hex HMAC-SHA256 over the requested byte ranges of *filepath*.
+
+    Matches the server contract in
+    `apps/web/server/api/routers/project/_vaultClaim.ts` — key is the raw
+    32-byte base64url-decoded nonce, message is the concatenation of the
+    bytes at each range in the order the server returned them.
+    """
+    key = _b64url_decode(nonce_b64url)
+    h = hmac.new(key, digestmod=hashlib.sha256)
+    with filepath.open("rb") as fh:
+        for r in ranges:
+            fh.seek(r.offset)
+            remaining = r.length
+            while remaining > 0:
+                chunk = fh.read(min(remaining, HASH_CHUNK_SIZE))
+                if not chunk:
+                    raise UploadError(
+                        f"short read at offset {r.offset} (need {r.length})"
+                    )
+                h.update(chunk)
+                remaining -= len(chunk)
+    return h.hexdigest()
 
 
 def get_allowed_filenames(
@@ -225,6 +302,130 @@ def get_signed_url(
         signed_url=data["signedUrl"],
         sample_id=data["sampleId"],
         file_id=data["fileId"],
+    )
+
+
+def claim_by_checksum(
+    project_metadata_id: str,
+    sample_id: str,
+    file_name: str,
+    checksum: str,
+    filesize: int,
+    token: str,
+    api_url: str,
+) -> ClaimChecksum:
+    """Step 1 of the FastQ-vault PoW dedup flow.
+
+    Asks the server whether the SHA-256 is already in the vault. If it is,
+    the server returns a signed byte-range challenge to prove possession;
+    otherwise it returns ``action='upload'`` and the caller falls through
+    to the normal upload path.
+
+    Raises:
+        TokenExpiredUploadError: On 401.
+        UploadError: On other non-200 responses (caller should fall back).
+        AuthError: On connection failures.
+    """
+    url = f"{api_url.rstrip('/')}/api/cli/claim-by-checksum"
+
+    try:
+        with httpx.Client(timeout=API_TIMEOUT) as client:
+            response = client.post(
+                url,
+                headers=_bearer_headers(token),
+                json={
+                    "projectMetadataId": project_metadata_id,
+                    "sampleId": sample_id,
+                    "fileName": file_name,
+                    "checksum": checksum,
+                    "filesize": filesize,
+                },
+            )
+    except httpx.TimeoutException as e:
+        raise AuthError(f"Request timed out connecting to {api_url}") from e
+    except httpx.RequestError as e:
+        raise AuthError(f"Failed to connect to {api_url}: {e}") from e
+
+    if response.status_code == 401:
+        raise TokenExpiredUploadError(
+            "Token expired during upload. Run 'ee-metadata login' again."
+        )
+    if response.status_code != 200:
+        raise UploadError(
+            f"claim-by-checksum failed ({response.status_code}): "
+            f"{_clean_response_body(response)}"
+        )
+
+    data = response.json()
+    action = data.get("action", "upload")
+    ranges: list[ChallengeRange] | None = None
+    if action == "challenge":
+        ranges = [
+            ChallengeRange(offset=int(r["offset"]), length=int(r["length"]))
+            for r in data.get("ranges", [])
+        ]
+    return ClaimChecksum(
+        action=action,
+        reason=data.get("reason"),
+        token=data.get("token"),
+        nonce=data.get("nonce"),
+        ranges=ranges,
+        expires_at=data.get("expiresAt"),
+    )
+
+
+def submit_checksum_challenge(
+    challenge_token: str,
+    mac: str,
+    token: str,
+    api_url: str,
+) -> ChallengeResult:
+    """Step 2 of the FastQ-vault PoW dedup flow.
+
+    Submits the HMAC the client computed over the server-chosen byte
+    ranges. On success the server links the project's ``ProjectFastqFile``
+    row to the existing vault object, and the upload is skipped.
+
+    Raises:
+        TokenExpiredUploadError: On 401.
+        UploadError: On 403 (denied — replay/bad MAC/stale target/expired)
+            or any other non-200. Callers should treat 403 as a signal to
+            fall back to a normal upload.
+        AuthError: On connection failures.
+    """
+    url = f"{api_url.rstrip('/')}/api/cli/submit-checksum-challenge"
+
+    try:
+        with httpx.Client(timeout=API_TIMEOUT) as client:
+            response = client.post(
+                url,
+                headers=_bearer_headers(token),
+                json={"token": challenge_token, "mac": mac},
+            )
+    except httpx.TimeoutException as e:
+        raise AuthError(f"Request timed out connecting to {api_url}") from e
+    except httpx.RequestError as e:
+        raise AuthError(f"Failed to connect to {api_url}: {e}") from e
+
+    if response.status_code == 401:
+        raise TokenExpiredUploadError(
+            "Token expired during upload. Run 'ee-metadata login' again."
+        )
+    if response.status_code == 403:
+        raise UploadError(
+            "Vault dedup challenge denied; will retry as a normal upload."
+        )
+    if response.status_code != 200:
+        raise UploadError(
+            f"submit-checksum-challenge failed ({response.status_code}): "
+            f"{_clean_response_body(response)}"
+        )
+
+    data = response.json()
+    return ChallengeResult(
+        status=data.get("status", "linked"),
+        fastq_file_id=data.get("fastqFileId", ""),
+        verify_triggered=bool(data.get("verifyTriggered", False)),
     )
 
 
@@ -649,7 +850,9 @@ def match_local_files(
             matched.append((local_path, af))
             matched_server_files.add(af.file_name)
 
-    unmatched_server = [af for af in allowed if af.file_name not in matched_server_files]
+    unmatched_server = [
+        af for af in allowed if af.file_name not in matched_server_files
+    ]
 
     return MatchResult(
         matched=matched,
@@ -761,7 +964,9 @@ def upload_file(
                 resume_offset = confirmed
                 log.info(
                     "Resuming %s from %d / %d bytes",
-                    filename, resume_offset, filesize,
+                    filename,
+                    resume_offset,
+                    filesize,
                 )
             elif confirmed >= filesize:
                 # Upload already complete on GCS — skip to verification
@@ -772,6 +977,69 @@ def upload_file(
             else:
                 # Session expired or invalid
                 clear_resume_state(project_id, filename)
+
+        # 1.5. Vault dedup pre-check (FastQ-vault PoW protocol).
+        # When the SHA-256 is already in the vault, the server returns a
+        # signed byte-range challenge; we answer it to prove possession
+        # and skip the upload entirely. Only attempted when there's no
+        # in-flight resumable session — if bytes are already on the wire,
+        # finish that upload rather than throwing away the work.
+        if session_uri is None:
+            sha256_hex = _compute_file_sha256(filepath)
+            try:
+                claim = claim_by_checksum(
+                    project_metadata_id=project_metadata_id,
+                    sample_id=allowed_file.sample_id,
+                    file_name=filename,
+                    checksum=sha256_hex,
+                    filesize=filesize,
+                    token=token,
+                    api_url=api_url,
+                )
+            except TokenExpiredUploadError:
+                raise
+            except (UploadError, AuthError) as e:
+                log.info(
+                    "claim-by-checksum unavailable for %s (%s); falling back to upload",
+                    filename,
+                    e,
+                )
+                claim = ClaimChecksum(action="upload", reason="claim_failed")
+
+            if (
+                claim.action == "challenge"
+                and claim.token
+                and claim.nonce
+                and claim.ranges
+            ):
+                try:
+                    mac_hex = _compute_challenge_mac(
+                        filepath, claim.nonce, claim.ranges
+                    )
+                    submit_checksum_challenge(
+                        challenge_token=claim.token,
+                        mac=mac_hex,
+                        token=token,
+                        api_url=api_url,
+                    )
+                    if progress_callback:
+                        progress_callback(filesize)
+                    return UploadResult(
+                        filename=filename,
+                        success=True,
+                        checksum=sha256_hex,
+                        filesize=filesize,
+                        deduped=True,
+                    )
+                except TokenExpiredUploadError:
+                    raise
+                except (UploadError, AuthError) as e:
+                    log.info(
+                        "Vault dedup challenge failed for %s (%s); "
+                        "falling back to normal upload",
+                        filename,
+                        e,
+                    )
 
         # 2. If no resume state, request a new resumable session
         if session_uri is None:
@@ -894,7 +1162,10 @@ def upload_file(
         except UploadError as e:
             if "not found" in str(e).lower() or "404" in str(e):
                 # Server doesn't support verify endpoint — skip verification
-                log.info("Verify endpoint not available, skipping verification for %s", filename)
+                log.info(
+                    "Verify endpoint not available, skipping verification for %s",
+                    filename,
+                )
             else:
                 raise
 
