@@ -1272,6 +1272,16 @@ class TestComputeChallengeMac:
             raw = b"\xab" * n
             assert _b64url_decode(_make_nonce_b64url(raw)) == raw
 
+    def test_b64url_decode_malformed_raises_uploaderror(self):
+        """A malformed nonce surfaces as UploadError so the dedup branch's
+        fallback handler catches it instead of crashing the worker.
+
+        Inputs whose length mod 4 == 1 are not legal base64; stdlib
+        raises ``binascii.Error`` rather than silently decoding.
+        """
+        with pytest.raises(UploadError, match="Invalid base64url nonce"):
+            _b64url_decode("A")  # length-1 → invalid byte count
+
     def test_short_read_raises(self, tmp_path):
         """If a range extends beyond EOF, an UploadError is raised."""
         filepath = tmp_path / "tiny.bin"
@@ -1405,6 +1415,72 @@ class TestUploadFileDedup:
 
         assert result.success
         assert result.deduped is False
+        mock_get_session.assert_called_once()
+        mock_complete.assert_called_once()
+
+        filepath.unlink()
+
+    @patch("ee_metadata.upload.verify_upload")
+    @patch("ee_metadata.upload.complete_upload")
+    @patch("ee_metadata.upload._resumable_upload_with_hash")
+    @patch("ee_metadata.upload.submit_checksum_challenge")
+    @patch("ee_metadata.upload.claim_by_checksum")
+    @patch("ee_metadata.upload.get_resumable_session")
+    @patch("ee_metadata.resume_store._config_dir")
+    def test_falls_back_when_challenge_nonce_malformed(
+        self,
+        mock_config_dir,
+        mock_get_session,
+        mock_claim,
+        mock_submit,
+        mock_stream,
+        mock_complete,
+        mock_verify,
+        tmp_path,
+    ):
+        """A malformed nonce from the server must not crash the worker.
+
+        Regression for greptile P1: ``base64.urlsafe_b64decode`` raises
+        ``binascii.Error`` (not ``UploadError``), which would otherwise
+        escape the dedup fallback handler and propagate out through
+        ``future.result()`` to abort the whole CLI command.
+        """
+        mock_config_dir.return_value = tmp_path / "config"
+        filepath = _tmp_file(b"data")
+        af = _make_allowed(filepath.name, "s1")
+
+        mock_claim.return_value = ClaimChecksum(
+            action="challenge",
+            token="jwt",
+            # 41 chars (length mod 4 == 1) — stdlib raises binascii.Error
+            # rather than silently decoding. Stand-in for a corrupted /
+            # truncated nonce reaching us from the server.
+            nonce="A" * 41,
+            ranges=[ChallengeRange(offset=0, length=4)],
+        )
+        mock_get_session.return_value = ResumableSession(
+            session_uri="https://storage.googleapis.com/upload/session/abc",
+            sample_id="s1",
+            file_id="f1",
+        )
+        mock_stream.return_value = ("abc123hash", "def456md5", 4)
+        mock_verify.return_value = VerifyResult(
+            ok=True, remote_md5="3vu+", remote_size=4, local_md5="3vu+", local_size=4
+        )
+
+        result = upload_file(
+            filepath=filepath,
+            allowed_file=af,
+            project_id=PROJECT_ID,
+            project_metadata_id="pm-1",
+            token=TOKEN,
+            api_url=API_URL,
+        )
+
+        # Did not crash; fell back to the normal upload path.
+        assert result.success
+        assert result.deduped is False
+        mock_submit.assert_not_called()
         mock_get_session.assert_called_once()
         mock_complete.assert_called_once()
 

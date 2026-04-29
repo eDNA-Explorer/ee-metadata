@@ -7,6 +7,7 @@ Supports byte-level resumable uploads for large FASTQ files.
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import hmac
 import logging
@@ -180,7 +181,13 @@ def _compute_file_sha256(filepath: Path) -> str:
 
 def _b64url_decode(s: str) -> bytes:
     pad = "=" * ((4 - len(s) % 4) % 4)
-    return base64.urlsafe_b64decode(s + pad)
+    try:
+        return base64.urlsafe_b64decode(s + pad)
+    except (binascii.Error, ValueError) as e:
+        # Convert decode failures into UploadError so the dedup branch's
+        # `except UploadError` falls back to a normal upload instead of
+        # crashing the worker (and, via future.result(), the whole CLI).
+        raise UploadError(f"Invalid base64url nonce: {e}") from e
 
 
 def _compute_challenge_mac(
